@@ -6,7 +6,7 @@ Installazione dipendenze:
     pip install telethon pandas python-dotenv
 
 Esempio di esecuzione:
-    python telegram_fake_news_analysis.py \
+    python3 telegram_fake_news_datacollection.py.py \
         --channels-file channels.txt \
         --keywords "fake news" disinformazione \
         --start-date 2026-01-01 \

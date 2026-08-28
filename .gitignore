@@ -1,1 +1,4 @@
 config.env
+channels.txt
+*.csv
+*.session
