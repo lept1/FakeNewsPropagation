@@ -42,7 +42,18 @@ from telethon import TelegramClient
 from telethon.errors import FloodWaitError
 from telethon.tl.types import PeerChannel, PeerChat, PeerUser
 
-OUTPUT_CSV = "telegram_fakenews_analysis.csv"
+from pathlib import Path
+
+PARENT_DIR = Path(__file__).parent.parent
+
+INPUT_DIR = PARENT_DIR / "in"
+OUTPUT_DIR = PARENT_DIR / "out"
+
+OUTPUT_CSV = OUTPUT_DIR / "telegram_fakenews_analysis.csv"
+
+INPUT_CHANNELS_FILE = INPUT_DIR / "channels.txt"
+
+INPUT_ENV = INPUT_DIR / "config.env"
 
 
 @dataclass
@@ -58,13 +69,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--channels-file",
-        required=True,
+        default=str(INPUT_CHANNELS_FILE),
         help="Path a file TXT con un canale Telegram pubblico per riga",
     )
     parser.add_argument(
         "--keywords",
         nargs="+",
-        required=True,
+        default=None,
         help="Una o piu parole chiave da cercare",
     )
     parser.add_argument(
@@ -79,7 +90,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--config-file",
-        default="config.env",
+        default=str(INPUT_ENV),
         help="Percorso file .env con API_ID/API_HASH/TG_SESSION",
     )
     return parser.parse_args()
