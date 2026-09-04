@@ -46,14 +46,15 @@ from pathlib import Path
 
 PARENT_DIR = Path(__file__).parent.parent
 
-INPUT_DIR = PARENT_DIR / "in"
-OUTPUT_DIR = PARENT_DIR / "out"
+VAR_DIR = PARENT_DIR / "var"
 
-OUTPUT_CSV = OUTPUT_DIR / "telegram_fakenews_analysis.csv"
+DATA_DIR = PARENT_DIR / "data_collected"
 
-INPUT_CHANNELS_FILE = INPUT_DIR / "channels.txt"
+OUTPUT_CSV = DATA_DIR / "telegram_fakenews_analysis.csv"
 
-INPUT_ENV = INPUT_DIR / "config.env"
+INPUT_CHANNELS_FILE = VAR_DIR / "channels.txt"
+
+INPUT_ENV = VAR_DIR / "config.env"
 
 
 @dataclass
@@ -351,6 +352,8 @@ async def main() -> None:
 
     if start_date and end_date and start_date > end_date:
         raise ValueError("start-date non puo essere successiva a end-date")
+
+    #client = TelegramClient(config.session_name, config.api_id, config.api_hash)
 
     async with TelegramClient(config.session_name, config.api_id, config.api_hash) as client:
         records = await collect_messages(
