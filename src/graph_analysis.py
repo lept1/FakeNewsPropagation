@@ -1,74 +1,112 @@
 #!/usr/bin/env python3
 """
-Genera un grafo di diffusione da dati Telegram raccolti in CSV.
+Costruisce una matrice di relazione e un grafo dai forward del snowball sampling.
 
 Dipendenze:
     pip install pandas networkx matplotlib
 
 Esempio:
-    python telegram_fake_news_graph.py \
-        --input-csv telegram_fakenews_analysis.csv \
-        --output-prefix telegram_diffusion_graph
+    python src/graph_analysis.py
 
 Output generati:
-- <output-prefix>.gexf  (grafo per Gephi/Cytoscape)
-- <output-prefix>.png   (visualizzazione rapida)
+- matrice relazioni CSV (source -> target)
+- grafo .gexf (Gephi/Cytoscape)
+- grafo .png (visualizzazione rapida)
 """
 
 from __future__ import annotations
 
-import argparse
+import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Tuple
 
 import matplotlib.pyplot as plt
-from matplotlib import cm, colors
 import networkx as nx
 import pandas as pd
 
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+CONFIG_DIR = PROJECT_ROOT / "config"
+INPUT_CONFIG = CONFIG_DIR / "config.json"
+
 REQUIRED_COLUMNS = {
-    "message_id",
-    "channel_username",
-    "views",
-    "forwards",
-    "is_forwarded",
-    "forward_from_chat",
-}
-
-SENTIMENT_LABEL_MAP = {
-    "positive": 1.0,
-    "neutral": 0.0,
-    "negative": -1.0,
+    "channel_to_id",
+    "channel_to_username",
+    "channel_to_title",
+    "channel_from_id",
+    "channel_from_username",
+    "channel_from_title",
+    "from_name_fallback",
+    "target_message_id",
 }
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Costruisce il grafo di diffusione dai dati della datacollection Telegram"
+@dataclass
+class GraphConfig:
+    relations_input_csv: str
+    relation_matrix_output_csv: str
+    graph_output_prefix: str
+    min_weight: int
+    include_unresolved_sources: bool
+
+
+def load_json_config(config_file: str) -> Dict[str, object]:
+    path = Path(config_file)
+    if not path.exists():
+        raise FileNotFoundError(f"File configurazione non trovato: {config_file}")
+
+    with path.open("r", encoding="utf-8") as handle:
+        raw_cfg = json.load(handle)
+
+    if not isinstance(raw_cfg, dict):
+        raise ValueError("Il file config deve contenere un oggetto JSON")
+
+    return raw_cfg
+
+
+def load_graph_config(config_file: str) -> GraphConfig:
+    cfg = load_json_config(config_file)
+
+    snowball_cfg = cfg.get("snowball", {})
+    graph_cfg = cfg.get("graph_analysis", {})
+
+    if not isinstance(snowball_cfg, dict):
+        raise ValueError("Sezione 'snowball' mancante o non valida")
+    if not isinstance(graph_cfg, dict):
+        graph_cfg = {}
+
+    default_relations_csv = str(
+        snowball_cfg.get("relations_output_csv", "data_collected/snowball_relations.csv")
     )
-    parser.add_argument(
-        "--input-csv",
-        default="telegram_fakenews_analysis.csv",
-        help="Path al CSV prodotto dallo script di datacollection",
+    relations_input_csv = str(
+        graph_cfg.get("relations_input_csv", default_relations_csv)
+    ).strip()
+    if not relations_input_csv:
+        relations_input_csv = default_relations_csv
+
+    relation_matrix_output_csv = str(
+        graph_cfg.get("relation_matrix_output_csv", "data_collected/snowball_relation_matrix.csv")
+    ).strip() or "data_collected/snowball_relation_matrix.csv"
+
+    graph_output_prefix = str(
+        graph_cfg.get("graph_output_prefix", "data_collected/snowball_relation_graph")
+    ).strip() or "data_collected/snowball_relation_graph"
+
+    try:
+        min_weight = int(graph_cfg.get("min_weight", 1))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("graph_analysis.min_weight deve essere un intero") from exc
+
+    include_unresolved_sources = bool(graph_cfg.get("include_unresolved_sources", False))
+
+    return GraphConfig(
+        relations_input_csv=relations_input_csv,
+        relation_matrix_output_csv=relation_matrix_output_csv,
+        graph_output_prefix=graph_output_prefix,
+        min_weight=max(1, min_weight),
+        include_unresolved_sources=include_unresolved_sources,
     )
-    parser.add_argument(
-        "--output-prefix",
-        default="telegram_diffusion_graph",
-        help="Prefisso dei file output (.gexf e .png)",
-    )
-    parser.add_argument(
-        "--min-weight",
-        type=int,
-        default=1,
-        help="Soglia minima del peso arco per essere visualizzato/salvato",
-    )
-    parser.add_argument(
-        "--include-unknown-sources",
-        action="store_true",
-        help="Include nodi forward con sorgente non identificata",
-    )
-    return parser.parse_args()
 
 
 def load_dataset(csv_path: str) -> pd.DataFrame:
@@ -85,92 +123,132 @@ def load_dataset(csv_path: str) -> pd.DataFrame:
     return df
 
 
-def is_unknown_source(source: str) -> bool:
-    source_l = source.strip().lower()
-    return source_l in {"", "none", "nan", "unknown_forward_source"}
+def normalize_cell(value: object) -> str:
+    if value is None:
+        return ""
+    text = str(value).strip()
+    lowered = text.lower()
+    if lowered in {"", "none", "nan"}:
+        return ""
+    return text
 
 
-def extract_row_sentiment_score(row: pd.Series) -> float | None:
-    if "sentiment_score" in row.index and pd.notna(row["sentiment_score"]):
-        try:
-            return float(row["sentiment_score"])
-        except (TypeError, ValueError):
-            pass
+def resolve_source_label(row: pd.Series) -> str:
+    source_username = normalize_cell(row.get("channel_from_username", ""))
+    source_title = normalize_cell(row.get("channel_from_title", ""))
+    source_fallback = normalize_cell(row.get("from_name_fallback", ""))
+    source_id = normalize_cell(row.get("channel_from_id", ""))
 
-    if "sentiment_label" in row.index and pd.notna(row["sentiment_label"]):
-        label = str(row["sentiment_label"]).strip().lower()
-        if label in SENTIMENT_LABEL_MAP:
-            return SENTIMENT_LABEL_MAP[label]
+    if source_username:
+        return source_username
+    if source_title:
+        return source_title
+    if source_fallback:
+        return source_fallback
+    if source_id:
+        return f"channel_id:{source_id}"
 
-    return None
+    return ""
+
+
+def resolve_target_label(row: pd.Series) -> str:
+    target_username = normalize_cell(row.get("channel_to_username", ""))
+    target_title = normalize_cell(row.get("channel_to_title", ""))
+    target_id = normalize_cell(row.get("channel_to_id", ""))
+
+    if target_username:
+        return target_username
+    if target_title:
+        return target_title
+    if target_id:
+        return f"channel_id:{target_id}"
+
+    return ""
+
+
+def is_unresolved_source(row: pd.Series) -> bool:
+    return not normalize_cell(row.get("channel_from_id", ""))
+
+
+def build_edges_dataframe(
+    df: pd.DataFrame,
+    include_unresolved_sources: bool,
+) -> pd.DataFrame:
+    rows = []
+
+    for _, row in df.iterrows():
+        if is_unresolved_source(row) and not include_unresolved_sources:
+            continue
+
+        source = resolve_source_label(row)
+        target = resolve_target_label(row)
+        if not source or not target:
+            continue
+
+        rows.append({"source": source, "target": target, "weight": 1})
+
+    if not rows:
+        return pd.DataFrame(columns=["source", "target", "weight"])
+
+    edges_df = pd.DataFrame(rows)
+    edges_df = (
+        edges_df.groupby(["source", "target"], as_index=False)["weight"]
+        .sum()
+        .sort_values(by=["weight", "source", "target"], ascending=[False, True, True])
+        .reset_index(drop=True)
+    )
+    return edges_df
+
+
+def build_relation_matrix(edges_df: pd.DataFrame) -> pd.DataFrame:
+    if edges_df.empty:
+        return pd.DataFrame()
+
+    matrix = pd.pivot_table(
+        edges_df,
+        index="source",
+        columns="target",
+        values="weight",
+        aggfunc="sum",
+        fill_value=0,
+    )
+    matrix = matrix.sort_index().reindex(sorted(matrix.columns), axis=1)
+    return matrix
+
+
+def save_relation_matrix(matrix_df: pd.DataFrame, output_csv: str) -> Path:
+    output_path = Path(output_csv)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    matrix_df.to_csv(output_path, encoding="utf-8")
+    return output_path
 
 
 def build_diffusion_graph(
-    df: pd.DataFrame,
+    edges_df: pd.DataFrame,
     min_weight: int,
-    include_unknown_sources: bool,
 ) -> nx.DiGraph:
     graph = nx.DiGraph()
 
-    forwarded_df = df[df["is_forwarded"].astype(bool)].copy()
-    if forwarded_df.empty:
+    if edges_df.empty:
         return graph
 
-    edge_stats: Dict[Tuple[str, str], Dict[str, float]] = {}
-    has_sentiment = False
+    for _, row in edges_df.iterrows():
+        source = str(row["source"])
+        target = str(row["target"])
+        weight = int(row["weight"])
 
-    for _, row in forwarded_df.iterrows():
-        source = str(row["forward_from_chat"]).strip()
-        target = str(row["channel_username"]).strip()
-
-        if not source or not target:
-            continue
-        if is_unknown_source(source) and not include_unknown_sources:
-            continue
-
-        edge_key = (source, target)
-        if edge_key not in edge_stats:
-            edge_stats[edge_key] = {
-                "messages": 0,
-                "sum_views": 0,
-                "sum_forwards": 0,
-                "sum_sentiment": 0.0,
-                "sentiment_count": 0,
-            }
-
-        edge_stats[edge_key]["messages"] += 1
-        edge_stats[edge_key]["sum_views"] += int(row.get("views", 0) or 0)
-        edge_stats[edge_key]["sum_forwards"] += int(row.get("forwards", 0) or 0)
-
-        sentiment_score = extract_row_sentiment_score(row)
-        if sentiment_score is not None:
-            edge_stats[edge_key]["sum_sentiment"] += sentiment_score
-            edge_stats[edge_key]["sentiment_count"] += 1
-            has_sentiment = True
-
-    for (source, target), stats in edge_stats.items():
-        if stats["messages"] < min_weight:
+        if weight < min_weight:
             continue
 
         graph.add_node(source, node_type="source")
         graph.add_node(target, node_type="channel")
 
-        sentiment_count = int(stats["sentiment_count"])
-        avg_sentiment = (
-            float(stats["sum_sentiment"]) / sentiment_count if sentiment_count > 0 else 0.0
-        )
-
         graph.add_edge(
             source,
             target,
-            weight=int(stats["messages"]),
-            views=int(stats["sum_views"]),
-            forwards=int(stats["sum_forwards"]),
-            sentiment_count=sentiment_count,
-            avg_sentiment=avg_sentiment,
+            weight=weight,
         )
-
-    graph.graph["has_sentiment"] = has_sentiment
 
     return graph
 
@@ -178,6 +256,9 @@ def build_diffusion_graph(
 def save_graph(graph: nx.DiGraph, output_prefix: str) -> Tuple[Path, Path]:
     gexf_path = Path(f"{output_prefix}.gexf")
     png_path = Path(f"{output_prefix}.png")
+
+    gexf_path.parent.mkdir(parents=True, exist_ok=True)
+    png_path.parent.mkdir(parents=True, exist_ok=True)
 
     nx.write_gexf(graph, gexf_path)
 
@@ -189,16 +270,6 @@ def save_graph(graph: nx.DiGraph, output_prefix: str) -> Tuple[Path, Path]:
     else:
         pos = nx.spring_layout(graph, seed=42, k=1.2)
         edge_weights = [max(1.0, float(data.get("weight", 1))) for _, _, data in graph.edges(data=True)]
-        has_sentiment = bool(graph.graph.get("has_sentiment", False))
-
-        if has_sentiment:
-            norm = colors.Normalize(vmin=-1.0, vmax=1.0)
-            edge_colors = [
-                cm.RdYlGn(norm(float(data.get("avg_sentiment", 0.0))))
-                for _, _, data in graph.edges(data=True)
-            ]
-        else:
-            edge_colors = "#5a5a5a"
 
         node_colors = [
             "#1f77b4" if graph.nodes[n].get("node_type") == "channel" else "#ff7f0e"
@@ -219,18 +290,12 @@ def save_graph(graph: nx.DiGraph, output_prefix: str) -> Tuple[Path, Path]:
             alpha=0.55,
             arrows=True,
             arrowsize=14,
-            edge_color=edge_colors,
+            edge_color="#5a5a5a",
         )
         nx.draw_networkx_labels(graph, pos, font_size=8)
 
-        plt.title("Rete di diffusione Telegram (forward source -> canale)")
+        plt.title("Rete di diffusione Telegram (snowball relations)")
         plt.axis("off")
-
-        if has_sentiment:
-            sm = cm.ScalarMappable(norm=norm, cmap=cm.RdYlGn)
-            sm.set_array([])
-            cbar = plt.colorbar(sm, ax=plt.gca(), fraction=0.03, pad=0.02)
-            cbar.set_label("Sentiment medio arco (-1 negativo, +1 positivo)")
 
     plt.tight_layout()
     plt.savefig(png_path, dpi=200)
@@ -254,44 +319,45 @@ def print_graph_summary(graph: nx.DiGraph) -> None:
         reverse=True,
     )[:5]
 
-    has_sentiment = bool(graph.graph.get("has_sentiment", False))
-    if has_sentiment:
-        weighted_sentiment_sum = 0.0
-        weighted_sentiment_count = 0
-        for _, _, data in graph.edges(data=True):
-            count = int(data.get("sentiment_count", 0))
-            weighted_sentiment_sum += float(data.get("avg_sentiment", 0.0)) * count
-            weighted_sentiment_count += count
-
-        if weighted_sentiment_count > 0:
-            overall_avg_sentiment = weighted_sentiment_sum / weighted_sentiment_count
-            print(f"Sentiment medio globale (solo forward con sentiment): {overall_avg_sentiment:.3f}")
-
     print("Top 5 archi per numero di messaggi inoltrati:")
     for source, target, data in top_edges:
-        base = (
-            f"  - {source} -> {target}: "
-            f"messaggi={data.get('weight', 0)}, "
-            f"views={data.get('views', 0)}, "
-            f"forwards={data.get('forwards', 0)}"
-        )
-        if has_sentiment and int(data.get("sentiment_count", 0)) > 0:
-            base += f", avg_sentiment={float(data.get('avg_sentiment', 0.0)):.3f}"
-        print(base)
+        print(f"  - {source} -> {target}: messaggi={data.get('weight', 0)}")
+
+
+def print_matrix_summary(matrix_df: pd.DataFrame) -> None:
+    print("\n===== RIEPILOGO MATRICE =====")
+    print(f"Sorgenti (righe): {len(matrix_df.index)}")
+    print(f"Destinazioni (colonne): {len(matrix_df.columns)}")
+
+    if matrix_df.empty:
+        print("Matrice vuota: nessuna relazione disponibile.")
+        return
+
+    non_zero = int((matrix_df > 0).sum().sum())
+    print(f"Celle con valore > 0: {non_zero}")
 
 
 def main() -> None:
-    args = parse_args()
+    cfg = load_graph_config(str(INPUT_CONFIG))
+    df = load_dataset(cfg.relations_input_csv)
 
-    df = load_dataset(args.input_csv)
-    graph = build_diffusion_graph(
+    edges_df = build_edges_dataframe(
         df=df,
-        min_weight=max(1, args.min_weight),
-        include_unknown_sources=args.include_unknown_sources,
+        include_unresolved_sources=cfg.include_unresolved_sources,
     )
 
-    gexf_path, png_path = save_graph(graph, args.output_prefix)
+    matrix_df = build_relation_matrix(edges_df)
+    matrix_path = save_relation_matrix(matrix_df, cfg.relation_matrix_output_csv)
+
+    graph = build_diffusion_graph(
+        edges_df=edges_df,
+        min_weight=cfg.min_weight,
+    )
+
+    gexf_path, png_path = save_graph(graph, cfg.graph_output_prefix)
+    print_matrix_summary(matrix_df)
     print_graph_summary(graph)
+    print(f"\nMatrice relazioni salvata in: {matrix_path}")
     print(f"\nGrafo GEXF salvato in: {gexf_path}")
     print(f"Immagine PNG salvata in: {png_path}")
 

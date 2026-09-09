@@ -13,7 +13,6 @@ from datetime import datetime, time, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import pandas as pd
-from dotenv import load_dotenv
 from telethon import TelegramClient
 from telethon.errors import FloodWaitError
 from telethon.tl.types import PeerChannel, PeerChat, PeerUser
@@ -30,14 +29,10 @@ from pathlib import Path
 PARENT_DIR = Path(__file__).parent.parent
 
 DATA_DIR = PARENT_DIR / "data_collected"
-VAR_DIR = PARENT_DIR / "var"
 TOPIC_DIR = PARENT_DIR / "topic_analysis"
 
 TOPIC_MODEL_FILE = TOPIC_DIR / "topic_model.pkl"
 INPUT_DATA = DATA_DIR / "telegram_fakenews_analysis.csv"
-INPUT_ENV = VAR_DIR / "config.env"
-
-load_dotenv(INPUT_ENV)
 
 df = pd.read_csv(INPUT_DATA)
 

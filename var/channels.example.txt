@@ -1,6 +1,0 @@
-# Esempio lista canali Telegram pubblici
-# Un canale per riga. Sono accettati sia username con @ sia senza.
-
-@canale_1
-canale_2
-canale_fake_news_demo
