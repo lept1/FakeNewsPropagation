@@ -22,6 +22,8 @@
     ],
     "messages_per_channel": 120,
     "max_depth": 2,
+    "save_interval_seconds": 30,
+    "log_level": "INFO",
     "channels_output_csv": "data_collected/snowball_channels.csv",
     "relations_output_csv": "data_collected/snowball_relations.csv"
   },

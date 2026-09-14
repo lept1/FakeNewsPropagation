@@ -20,11 +20,14 @@ import argparse
 import asyncio
 import csv
 import json
+import logging
 from collections import deque
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional, Set, Tuple
+import qrcode
 
 from telethon import TelegramClient
 from telethon.errors import FloodWaitError
@@ -39,6 +42,8 @@ DEFAULT_CONFIG_FILE = CONFIG_DIR / "config.json"
 DEFAULT_CHANNELS_OUTPUT = DATA_DIR / "snowball_channels.csv"
 DEFAULT_RELATIONS_OUTPUT = DATA_DIR / "snowball_relations.csv"
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class TelegramConfig:
@@ -51,6 +56,8 @@ class TelegramConfig:
 class SamplingConfig:
     messages_per_channel: int
     max_depth: int
+    save_interval_seconds: int
+    log_level: str
 
 
 @dataclass
@@ -157,13 +164,20 @@ def load_run_config(config_file: str) -> RunConfig:
     try:
         messages_per_channel = int(snowball_cfg.get("messages_per_channel", 100))
         max_depth = int(snowball_cfg.get("max_depth", 1))
+        save_interval_seconds = int(snowball_cfg.get("save_interval_seconds", 30))
     except (TypeError, ValueError) as exc:
         raise ValueError("Valori snowball numerici non validi") from exc
+
+    log_level = str(snowball_cfg.get("log_level", "INFO")).strip().upper()
+    if not isinstance(getattr(logging, log_level, None), int):
+        raise ValueError("snowball.log_level deve essere uno tra DEBUG, INFO, WARNING, ERROR, CRITICAL")
 
     if messages_per_channel <= 0:
         raise ValueError("snowball.messages_per_channel deve essere > 0")
     if max_depth < 0:
         raise ValueError("snowball.max_depth deve essere >= 0")
+    if save_interval_seconds <= 0:
+        raise ValueError("snowball.save_interval_seconds deve essere > 0")
 
     channels_output = str(
         snowball_cfg.get("channels_output_csv", DEFAULT_CHANNELS_OUTPUT)
@@ -177,6 +191,8 @@ def load_run_config(config_file: str) -> RunConfig:
         sampling=SamplingConfig(
             messages_per_channel=messages_per_channel,
             max_depth=max_depth,
+            save_interval_seconds=save_interval_seconds,
+            log_level=log_level,
         ),
         seed_channels=seed_channels,
         channels_output=channels_output,
@@ -241,6 +257,63 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
+def configure_logging(log_level: str) -> None:
+    numeric_level = getattr(logging, log_level, logging.INFO)
+    logging.basicConfig(
+        level=numeric_level,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    )
+
+
+class IncrementalCsvWriter:
+    def __init__(
+        self,
+        output_file: str,
+        fieldnames: List[str],
+        flush_interval_seconds: int,
+    ) -> None:
+        output_path = Path(output_file)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        self._file = output_path.open("w", encoding="utf-8", newline="")
+        self._writer = csv.DictWriter(
+            self._file,
+            fieldnames=fieldnames,
+            quoting=csv.QUOTE_ALL,
+        )
+        self._writer.writeheader()
+
+        self._pending_rows: List[Dict[str, Any]] = []
+        self._flush_interval_seconds = flush_interval_seconds
+        self._last_flush_ts = asyncio.get_running_loop().time()
+
+    def add_row(self, row: Dict[str, Any]) -> None:
+        self._pending_rows.append(row)
+
+    def maybe_flush(self, *, force: bool = False) -> int:
+        now = asyncio.get_running_loop().time()
+        if not self._pending_rows:
+            if force:
+                self._file.flush()
+            return 0
+
+        elapsed = now - self._last_flush_ts
+        if not force and elapsed < self._flush_interval_seconds:
+            return 0
+
+        self._writer.writerows(self._pending_rows)
+        written_rows = len(self._pending_rows)
+        self._pending_rows.clear()
+        self._file.flush()
+        self._last_flush_ts = now
+        return written_rows
+
+    def close(self) -> None:
+        self.maybe_flush(force=True)
+        with suppress(Exception):
+            self._file.close()
+
+
 async def resolve_channel_entity(
     client: TelegramClient,
     channel_ref: str,
@@ -250,7 +323,8 @@ async def resolve_channel_entity(
     except FloodWaitError as exc:
         await asyncio.sleep(int(exc.seconds) + 1)
         entity = await client.get_entity(channel_ref)
-    except Exception:
+    except Exception as exc:
+        logger.debug("Impossibile risolvere il canale '%s': %s", channel_ref, exc)
         return None
 
     if isinstance(entity, Channel):
@@ -273,7 +347,8 @@ async def resolve_source_channel(
     except FloodWaitError as exc:
         await asyncio.sleep(int(exc.seconds) + 1)
         source_entity = await client.get_entity(from_peer)
-    except Exception:
+    except Exception as exc:
+        logger.debug("Impossibile risolvere il canale sorgente '%s': %s", source_id, exc)
         source_entity = None
 
     if isinstance(source_entity, Channel):
@@ -286,121 +361,205 @@ async def run_snowball_sampling(
     client: TelegramClient,
     seed_channels: List[str],
     sampling_cfg: SamplingConfig,
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    channels_output_file: str,
+    relations_output_file: str,
+) -> Tuple[int, int, int]:
     queue: Deque[QueueItem] = deque([QueueItem(ch, 0) for ch in seed_channels])
     visited: Set[str] = set()
 
-    channels_by_key: Dict[str, Dict[str, Any]] = {}
-    relations: List[Dict[str, Any]] = []
+    discovered_channel_keys: Set[str] = set()
+    relations_count = 0
 
     seed_set = {normalize_channel_ref(item) for item in seed_channels if item.strip()}
     unresolved_seed_refs: Set[str] = set(seed_set)
 
-    while queue:
-        current = queue.popleft()
-        if current.depth > sampling_cfg.max_depth:
-            continue
+    channels_writer = IncrementalCsvWriter(
+        output_file=channels_output_file,
+        fieldnames=[
+            "channel_id",
+            "username",
+            "title",
+            "is_seed",
+            "discovered_depth",
+            "participants_count",
+            "broadcast",
+            "megagroup",
+            "verified",
+            "scam",
+            "fake",
+            "date_collected_utc",
+            "resolution_status",
+        ],
+        flush_interval_seconds=sampling_cfg.save_interval_seconds,
+    )
+    relations_writer = IncrementalCsvWriter(
+        output_file=relations_output_file,
+        fieldnames=[
+            "channel_to_id",
+            "channel_to_username",
+            "channel_to_title",
+            "channel_from_id",
+            "channel_from_username",
+            "channel_from_title",
+            "from_name_fallback",
+            "target_message_id",
+            "target_message_date_utc",
+            "sampling_depth",
+        ],
+        flush_interval_seconds=sampling_cfg.save_interval_seconds,
+    )
 
-        current_entity = await resolve_channel_entity(client, current.channel_ref)
-        if current_entity is None:
-            continue
-
-        current_key = channel_key_from_id(int(current_entity.id))
-        if current_key in visited:
-            continue
-
-        visited.add(current_key)
-
-        is_seed = normalize_channel_ref(current.channel_ref) in seed_set
-        if is_seed:
-            unresolved_seed_refs.discard(normalize_channel_ref(current.channel_ref))
-
-        channels_by_key[current_key] = build_channel_record(
-            current_entity,
-            is_seed=is_seed,
-            depth=current.depth,
-        )
-
-        try:
-            iterator = client.iter_messages(
-                entity=current_entity,
-                limit=sampling_cfg.messages_per_channel,
+    def maybe_flush_writers(force: bool = False) -> None:
+        channels_written = channels_writer.maybe_flush(force=force)
+        relations_written = relations_writer.maybe_flush(force=force)
+        if channels_written > 0 or relations_written > 0:
+            logger.info(
+                "Checkpoint CSV salvato (%ss): +canali=%s, +relazioni=%s",
+                sampling_cfg.save_interval_seconds,
+                channels_written,
+                relations_written,
             )
 
-            async for message in iterator:
-                fwd_from = getattr(message, "fwd_from", None)
-                if not fwd_from:
-                    continue
+    try:
+        while queue:
+            current = queue.popleft()
+            if current.depth > sampling_cfg.max_depth:
+                continue
+            logger.info(
+                "Elaborazione canale=%s profondita=%s coda_rimanente=%s",
+                current.channel_ref,
+                current.depth,
+                len(queue),
+            )
+            current_entity = await resolve_channel_entity(client, current.channel_ref)
+            if current_entity is None:
+                logger.warning("Canale non risolto: %s", current.channel_ref)
+                continue
 
-                from_peer = getattr(fwd_from, "from_id", None)
-                source_entity, source_id = await resolve_source_channel(client, from_peer)
+            current_key = channel_key_from_id(int(current_entity.id))
+            if current_key in visited:
+                continue
 
-                from_username = ""
-                from_title = ""
-                from_name_fallback = ""
+            visited.add(current_key)
 
-                if source_entity is not None:
-                    source_key = channel_key_from_id(int(source_entity.id))
-                    if source_key not in channels_by_key:
-                        channels_by_key[source_key] = build_channel_record(
-                            source_entity,
-                            is_seed=False,
-                            depth=current.depth + 1,
-                        )
+            is_seed = normalize_channel_ref(current.channel_ref) in seed_set
+            if is_seed:
+                unresolved_seed_refs.discard(normalize_channel_ref(current.channel_ref))
 
-                    from_username = source_entity.username or ""
-                    from_title = source_entity.title or ""
-
-                    if current.depth + 1 <= sampling_cfg.max_depth:
-                        if source_key not in visited:
-                            next_ref = from_username or str(source_entity.id)
-                            queue.append(QueueItem(next_ref, current.depth + 1))
-                else:
-                    from_name_fallback = str(getattr(fwd_from, "from_name", "") or "")
-
-                relations.append(
-                    {
-                        "channel_to_id": int(current_entity.id),
-                        "channel_to_username": current_entity.username or "",
-                        "channel_to_title": current_entity.title or "",
-                        "channel_from_id": int(source_id) if source_id is not None else "",
-                        "channel_from_username": from_username,
-                        "channel_from_title": from_title,
-                        "from_name_fallback": from_name_fallback,
-                        "target_message_id": int(message.id),
-                        "target_message_date_utc": serialize_date(message.date),
-                        "sampling_depth": int(current.depth),
-                    }
+            if current_key not in discovered_channel_keys:
+                channels_writer.add_row(
+                    build_channel_record(
+                        current_entity,
+                        is_seed=is_seed,
+                        depth=current.depth,
+                    )
                 )
+                discovered_channel_keys.add(current_key)
 
-        except FloodWaitError as exc:
-            await asyncio.sleep(int(exc.seconds) + 1)
-        except Exception:
-            continue
+            logger.debug(
+                "Lettura messaggi canale=%s limit=%s",
+                current.channel_ref,
+                sampling_cfg.messages_per_channel,
+            )
+            try:
+                iterator = client.iter_messages(
+                    entity=current_entity,
+                    limit=sampling_cfg.messages_per_channel,
+                )
+                i=1
+                async for message in iterator:
+                    logger.debug(
+                        "Processing message id=%s from channel=%s (message count=%s)",
+                        message.id,
+                        current.channel_ref,
+                        i,
+                    )
+                    i += 1
+                    fwd_from = getattr(message, "fwd_from", None)
+                    if not fwd_from:
+                        continue
 
-    for unresolved_seed in sorted(unresolved_seed_refs):
-        placeholder_key = f"seed_ref:{unresolved_seed}"
-        channels_by_key[placeholder_key] = build_unresolved_seed_record(unresolved_seed)
+                    from_peer = getattr(fwd_from, "from_id", None)
+                    source_entity, source_id = await resolve_source_channel(client, from_peer)
 
-    channels = list(channels_by_key.values())
-    channels.sort(
-        key=lambda row: (
-            _safe_int(row.get("discovered_depth", 0), 0),
-            1 if str(row.get("channel_id", "")).strip() == "" else 0,
-            _safe_int(row.get("channel_id", 0), 0),
-            str(row.get("username", "")).lower(),
-        )
+                    from_username = ""
+                    from_title = ""
+                    from_name_fallback = ""
+
+                    if source_entity is not None:
+                        source_key = channel_key_from_id(int(source_entity.id))
+                        if source_key not in discovered_channel_keys:
+                            channels_writer.add_row(
+                                build_channel_record(
+                                    source_entity,
+                                    is_seed=False,
+                                    depth=current.depth + 1,
+                                )
+                            )
+                            discovered_channel_keys.add(source_key)
+
+                        from_username = source_entity.username or ""
+                        from_title = source_entity.title or ""
+
+                        if current.depth + 1 <= sampling_cfg.max_depth:
+                            if source_key not in visited:
+                                next_ref = from_username or str(source_entity.id)
+                                queue.append(QueueItem(next_ref, current.depth + 1))
+                    else:
+                        from_name_fallback = str(getattr(fwd_from, "from_name", "") or "")
+
+                    relations_writer.add_row(
+                        {
+                            "channel_to_id": int(current_entity.id),
+                            "channel_to_username": current_entity.username or "",
+                            "channel_to_title": current_entity.title or "",
+                            "channel_from_id": int(source_id) if source_id is not None else "",
+                            "channel_from_username": from_username,
+                            "channel_from_title": from_title,
+                            "from_name_fallback": from_name_fallback,
+                            "target_message_id": int(message.id),
+                            "target_message_date_utc": serialize_date(message.date),
+                            "sampling_depth": int(current.depth),
+                        }
+                    )
+                    relations_count += 1
+                    maybe_flush_writers()
+
+            except FloodWaitError as exc:
+                logger.warning(
+                    "FloodWait durante lettura canale=%s: pausa %ss",
+                    current.channel_ref,
+                    exc.seconds,
+                )
+                await asyncio.sleep(int(exc.seconds) + 1)
+                maybe_flush_writers()
+            except Exception as exc:
+                logger.exception(
+                    "Errore durante la scansione del canale=%s: %s",
+                    current.channel_ref,
+                    exc,
+                )
+                continue
+
+            maybe_flush_writers()
+
+        for unresolved_seed in sorted(unresolved_seed_refs):
+            channels_writer.add_row(build_unresolved_seed_record(unresolved_seed))
+
+        maybe_flush_writers(force=True)
+    finally:
+        channels_writer.close()
+        relations_writer.close()
+
+    seeds_count = len(seed_set)
+    total_channels_count = len(discovered_channel_keys) + len(unresolved_seed_refs)
+    logger.info(
+        "Sampling completato: canali_totali=%s canali_seed=%s relazioni=%s",
+        total_channels_count,
+        seeds_count,
+        relations_count,
     )
-
-    relations.sort(
-        key=lambda row: (
-            int(row["sampling_depth"]),
-            int(row["channel_to_id"]),
-            int(row["target_message_id"]),
-        )
-    )
-
-    return channels, relations
+    return total_channels_count, seeds_count, relations_count
 
 
 def write_channels_csv(channels: List[Dict[str, Any]], output_file: str) -> None:
@@ -452,20 +611,20 @@ def write_relations_csv(relations: List[Dict[str, Any]], output_file: str) -> No
         writer.writerows(relations)
 
 
-def print_summary(channels: List[Dict[str, Any]], relations: List[Dict[str, Any]]) -> None:
-    seeds = sum(1 for item in channels if int(item.get("is_seed", 0)) == 1)
-    discovered = len(channels) - seeds
+def print_summary(total_channels: int, seeds: int, relations_count: int) -> None:
+    discovered = total_channels - seeds
 
-    print("\n===== SNOWBALL SAMPLING SUMMARY =====")
-    print(f"Canali totali: {len(channels)}")
-    print(f"Canali seed: {seeds}")
-    print(f"Canali scoperti: {discovered}")
-    print(f"Relazioni raccolte: {len(relations)}")
+    logger.info("===== SNOWBALL SAMPLING SUMMARY =====")
+    logger.info("Canali totali: %s", total_channels)
+    logger.info("Canali seed: %s", seeds)
+    logger.info("Canali scoperti: %s", discovered)
+    logger.info("Relazioni raccolte: %s", relations_count)
 
 
 def main() -> None:
     args = parse_args()
     run_cfg = load_run_config(args.config)
+    configure_logging(run_cfg.sampling.log_level)
 
     channels_output = args.channels_output if args.channels_output else run_cfg.channels_output
     relations_output = (
@@ -473,23 +632,50 @@ def main() -> None:
     )
 
     async def _async_main() -> None:
-        async with TelegramClient(
+        client=TelegramClient(
             run_cfg.telegram.session_name,
             run_cfg.telegram.api_id,
             run_cfg.telegram.api_hash,
-        ) as client:
-            channels, relations = await run_snowball_sampling(
+        )
+        await client.connect()
+        logger.info("Connessione Telegram avviata")
+
+        if not await client.is_user_authorized():
+            qr = await client.qr_login()
+            logger.warning("Utente non autorizzato: richiesta autenticazione via QR")
+            print("\n📱 QR-Code scannen:")
+            print("Telegram → Einstellungen → Geräte → Gerät hinzufügen\n")
+
+            # ASCII QR ohne console-Module
+            qr_img = qrcode.QRCode(border=1)
+            qr_img.add_data(qr.url)
+            qr_img.make(fit=True)
+
+            # ASCII-Ausgabe
+            qr_matrix = qr_img.get_matrix()
+            for row in qr_matrix:
+                print("".join("██" if cell else "  " for cell in row))
+
+            await qr.wait()
+            logger.info("Autenticazione QR completata")
+        me = await client.get_me()
+        logger.info("Autenticato come: %s", me.first_name)
+
+        logger.info("Avvio campionamento snowball")
+        logger.info("Canali seed iniziali (%s):", len(run_cfg.seed_channels))
+        for seed in run_cfg.seed_channels:
+            logger.info(" - %s", seed)
+        total_channels, seeds, relations_count = await run_snowball_sampling(
                 client=client,
                 seed_channels=run_cfg.seed_channels,
                 sampling_cfg=run_cfg.sampling,
+                channels_output_file=channels_output,
+                relations_output_file=relations_output,
             )
 
-        write_channels_csv(channels, channels_output)
-        write_relations_csv(relations, relations_output)
-
-        print_summary(channels, relations)
-        print(f"CSV canali salvato in: {channels_output}")
-        print(f"CSV relazioni salvato in: {relations_output}")
+        print_summary(total_channels, seeds, relations_count)
+        logger.info("CSV canali salvato in: %s", channels_output)
+        logger.info("CSV relazioni salvato in: %s", relations_output)
 
     asyncio.run(_async_main())
 
