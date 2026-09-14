@@ -318,13 +318,18 @@ async def resolve_channel_entity(
     client: TelegramClient,
     channel_ref: str,
 ) -> Optional[Channel]:
+    
     try:
-        entity = await client.get_entity(channel_ref)
+        logger.debug("Resolving channel entity for '%s'", channel_ref)
+        entity = await client.get_input_entity(channel_ref)
+        logger.debug("Resolved channel entity for '%s': %s", channel_ref, entity)
     except FloodWaitError as exc:
+        logger.warning("Flood wait error while resolving channel '%s': %s", channel_ref, exc)
         await asyncio.sleep(int(exc.seconds) + 1)
-        entity = await client.get_entity(channel_ref)
+        entity = await client.get_input_entity(channel_ref)
+
     except Exception as exc:
-        logger.debug("Impossibile risolvere il canale '%s': %s", channel_ref, exc)
+        logger.warning("Impossibile risolvere il canale '%s': %s", channel_ref, exc)
         return None
 
     if isinstance(entity, Channel):
@@ -343,12 +348,13 @@ async def resolve_source_channel(
     source_id = int(from_peer.channel_id)
 
     try:
-        source_entity = await client.get_entity(from_peer)
+        source_entity = await client.get_input_entity(from_peer)
     except FloodWaitError as exc:
+        logger.warning("Flood wait error while resolving source channel '%s': %s", source_id, exc)
         await asyncio.sleep(int(exc.seconds) + 1)
-        source_entity = await client.get_entity(from_peer)
+        source_entity = await client.get_input_entity(from_peer)
     except Exception as exc:
-        logger.debug("Impossibile risolvere il canale sorgente '%s': %s", source_id, exc)
+        logger.warning("Impossibile risolvere il canale sorgente '%s': %s", source_id, exc)
         source_entity = None
 
     if isinstance(source_entity, Channel):
@@ -436,6 +442,11 @@ async def run_snowball_sampling(
                 logger.warning("Canale non risolto: %s", current.channel_ref)
                 continue
 
+            logger.debug(
+                "Risolto canale=%s",
+                current.channel_ref
+            )
+
             current_key = channel_key_from_id(int(current_entity.id))
             if current_key in visited:
                 continue
@@ -453,6 +464,11 @@ async def run_snowball_sampling(
                         is_seed=is_seed,
                         depth=current.depth,
                     )
+                )
+                logger.debug(
+                    "Aggiunto canale scoperto=%s a chiave=%s",
+                    current.channel_ref,
+                    current_key,
                 )
                 discovered_channel_keys.add(current_key)
 
