@@ -113,7 +113,7 @@ def load_app_config(config_file: str) -> AppConfig:
         raise ValueError("message_collection.keywords deve essere una lista")
     keywords = [str(item).strip() for item in raw_keywords if str(item).strip()]
     if not keywords:
-        raise ValueError("message_collection.keywords non puo essere vuoto")
+        keywords = [""]
 
     output_csv = str(message_cfg.get("output_csv", DEFAULT_OUTPUT_CSV)).strip()
     if not output_csv:
@@ -122,11 +122,9 @@ def load_app_config(config_file: str) -> AppConfig:
     channels_source_csv = str(
         message_cfg.get(
             "channels_source_csv",
-            snowball_cfg.get("channels_output_csv", DEFAULT_SNOWBALL_CHANNELS_CSV),
+            DEFAULT_SNOWBALL_CHANNELS_CSV,
         )
     ).strip()
-    if not channels_source_csv:
-        channels_source_csv = str(DEFAULT_SNOWBALL_CHANNELS_CSV)
 
     channels_csv_column = str(message_cfg.get("channels_csv_column", "username")).strip()
     if not channels_csv_column:
@@ -251,20 +249,23 @@ async def iter_messages_with_flood_wait(client: TelegramClient, **kwargs: Any):
 async def collect_messages(
     client: TelegramClient,
     channels: Sequence[str],
-    keywords: Sequence[str],
+    keywords: Optional[Sequence[str]],
     start_date: Optional[datetime],
     end_date: Optional[datetime],
+    limit: Optional[int],
 ) -> List[Dict[str, Any]]:
     results: Dict[Tuple[str, int], Dict[str, Any]] = {}
 
     for raw_channel in channels:
         channel = normalize_channel(raw_channel)
-
         for keyword in keywords:
+            if keyword == "":
+                keyword = None
             async for message in iter_messages_with_flood_wait(
                 client,
                 entity=channel,
                 search=keyword,
+                limit=limit
             ):
                 text = message.message or ""
                 if not text:

@@ -321,12 +321,12 @@ async def resolve_channel_entity(
     
     try:
         logger.debug("Resolving channel entity for '%s'", channel_ref)
-        entity = await client.get_input_entity(channel_ref)
+        entity = await client.get_entity(channel_ref)
         logger.debug("Resolved channel entity for '%s': %s", channel_ref, entity)
     except FloodWaitError as exc:
         logger.warning("Flood wait error while resolving channel '%s': %s", channel_ref, exc)
         await asyncio.sleep(int(exc.seconds) + 1)
-        entity = await client.get_input_entity(channel_ref)
+        entity = await client.get_entity(channel_ref)
 
     except Exception as exc:
         logger.warning("Impossibile risolvere il canale '%s': %s", channel_ref, exc)
@@ -348,11 +348,11 @@ async def resolve_source_channel(
     source_id = int(from_peer.channel_id)
 
     try:
-        source_entity = await client.get_input_entity(from_peer)
+        source_entity = await client.get_entity(from_peer)
     except FloodWaitError as exc:
         logger.warning("Flood wait error while resolving source channel '%s': %s", source_id, exc)
         await asyncio.sleep(int(exc.seconds) + 1)
-        source_entity = await client.get_input_entity(from_peer)
+        source_entity = await client.get_entity(from_peer)
     except Exception as exc:
         logger.warning("Impossibile risolvere il canale sorgente '%s': %s", source_id, exc)
         source_entity = None
