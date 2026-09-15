@@ -51,6 +51,7 @@ class AppConfig:
     output_csv: str
     start_date: Optional[datetime]
     end_date: Optional[datetime]
+    limit: Optional[int]
 
 
 def load_json_config(config_file: str) -> Dict[str, Any]:
@@ -119,12 +120,9 @@ def load_app_config(config_file: str) -> AppConfig:
     if not output_csv:
         output_csv = str(DEFAULT_OUTPUT_CSV)
 
-    channels_source_csv = str(
-        message_cfg.get(
-            "channels_source_csv",
-            DEFAULT_SNOWBALL_CHANNELS_CSV,
-        )
-    ).strip()
+    channels_source_csv = message_cfg.get("channels_source_csv")
+    if channels_source_csv is None or not channels_source_csv:
+        channels_source_csv = str(DEFAULT_SNOWBALL_CHANNELS_CSV).strip()
 
     channels_csv_column = str(message_cfg.get("channels_csv_column", "username")).strip()
     if not channels_csv_column:
@@ -142,6 +140,8 @@ def load_app_config(config_file: str) -> AppConfig:
     if start_date and end_date and start_date > end_date:
         raise ValueError("message_collection.start_date non puo essere successiva a end_date")
 
+    limit = int(message_cfg.get("limit", 100))
+
     return AppConfig(
         api_id=api_id,
         api_hash=api_hash,
@@ -152,6 +152,7 @@ def load_app_config(config_file: str) -> AppConfig:
         output_csv=output_csv,
         start_date=start_date,
         end_date=end_date,
+        limit=limit,
     )
 
 
@@ -369,6 +370,7 @@ async def main() -> None:
             keywords=keywords,
             start_date=config.start_date,
             end_date=config.end_date,
+            limit=config.limit
         )
 
     df = build_dataframe(records)
