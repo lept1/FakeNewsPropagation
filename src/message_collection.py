@@ -15,8 +15,10 @@ Esempio di esecuzione:
 from __future__ import annotations
 
 import asyncio
+import argparse
 import csv
 import json
+import logging
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime, time, timezone
@@ -38,6 +40,18 @@ DATA_DIR = PARENT_DIR / "data_collected"
 DEFAULT_OUTPUT_CSV = DATA_DIR / "telegram_fakenews_analysis.csv"
 DEFAULT_SNOWBALL_CHANNELS_CSV = DATA_DIR / "snowball_channels.csv"
 INPUT_CONFIG = CONFIG_DIR / "config.json"
+OUTPUT_COLUMNS = [
+    "message_id",
+    "channel_username",
+    "date",
+    "text",
+    "views",
+    "forwards",
+    "is_forwarded",
+    "forward_from_chat",
+]
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -52,6 +66,41 @@ class AppConfig:
     start_date: Optional[datetime]
     end_date: Optional[datetime]
     limit: Optional[int]
+    log_level: str
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Raccoglie messaggi Telegram da canali e keyword"
+    )
+    parser.add_argument(
+        "--config",
+        default=str(INPUT_CONFIG),
+        help="File JSON unico di configurazione",
+    )
+    parser.add_argument(
+        "--log-level",
+        default="",
+        help="Override livello log (DEBUG, INFO, WARNING, ERROR, CRITICAL)",
+    )
+    return parser.parse_args()
+
+
+def configure_logging(log_level: str) -> None:
+    numeric_level = getattr(logging, log_level.upper(), logging.INFO)
+    logging.basicConfig(
+        level=numeric_level,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    )
+
+
+def validate_log_level(log_level: str) -> str:
+    normalized = str(log_level).strip().upper() or "INFO"
+    if not isinstance(getattr(logging, normalized, None), int):
+        raise ValueError(
+            "message_collection.log_level deve essere uno tra DEBUG, INFO, WARNING, ERROR, CRITICAL"
+        )
+    return normalized
 
 
 def load_json_config(config_file: str) -> Dict[str, Any]:
@@ -84,6 +133,7 @@ def parse_iso_datetime(raw_value: Optional[str], *, is_end: bool) -> Optional[da
 
 
 def load_app_config(config_file: str) -> AppConfig:
+    logger.debug("Caricamento configurazione da: %s", config_file)
     cfg = load_json_config(config_file)
 
     telegram = cfg.get("telegram", {})
@@ -141,6 +191,7 @@ def load_app_config(config_file: str) -> AppConfig:
         raise ValueError("message_collection.start_date non puo essere successiva a end_date")
 
     limit = int(message_cfg.get("limit", 100))
+    log_level = validate_log_level(str(message_cfg.get("log_level", "INFO")))
 
     return AppConfig(
         api_id=api_id,
@@ -153,11 +204,39 @@ def load_app_config(config_file: str) -> AppConfig:
         start_date=start_date,
         end_date=end_date,
         limit=limit,
+        log_level=log_level,
     )
 
 
 def normalize_channel(channel: str) -> str:
     return channel.lstrip("@").strip()
+
+
+def initialize_output_csv(output_path: str) -> None:
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=OUTPUT_COLUMNS,
+            quoting=csv.QUOTE_ALL,
+        )
+        writer.writeheader()
+
+
+def append_records_to_csv(records: List[Dict[str, Any]], output_path: str) -> None:
+    if not records:
+        return
+
+    path = Path(output_path)
+    with path.open("a", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=OUTPUT_COLUMNS,
+            quoting=csv.QUOTE_ALL,
+            lineterminator="\n",
+        )
+        writer.writerows(records)
 
 
 def load_channels_from_snowball_csv(csv_path: str, channel_column: str) -> List[str]:
@@ -243,7 +322,7 @@ async def iter_messages_with_flood_wait(client: TelegramClient, **kwargs: Any):
             return
         except FloodWaitError as exc:
             wait_seconds = int(exc.seconds) + 1
-            print(f"[FloodWait] Attendo {wait_seconds}s prima di riprendere...")
+            logger.warning("FloodWait rilevato: attendo %ss prima di riprendere", wait_seconds)
             await asyncio.sleep(wait_seconds)
 
 
@@ -254,29 +333,69 @@ async def collect_messages(
     start_date: Optional[datetime],
     end_date: Optional[datetime],
     limit: Optional[int],
-) -> List[Dict[str, Any]]:
-    results: Dict[Tuple[str, int], Dict[str, Any]] = {}
+    output_csv: str,
+) -> int:
+    total_written = 0
+    seen_keys: set[Tuple[str, int]] = set()
+    logger.info(
+        "Avvio raccolta messaggi: canali=%s keyword=%s limit=%s",
+        len(channels),
+        len(keywords or []),
+        limit,
+    )
+    logger.info(
+        "Filtro date UTC: start=%s end=%s",
+        start_date.isoformat() if start_date else "None",
+        end_date.isoformat() if end_date else "None",
+    )
 
     for raw_channel in channels:
         channel = normalize_channel(raw_channel)
+        logger.info("Elaborazione canale: %s", channel)
+        channel_results: Dict[Tuple[str, int], Dict[str, Any]] = {}
         for keyword in keywords:
             if keyword == "":
                 keyword = None
+            logger.debug(
+                "Lettura messaggi canale=%s keyword=%s",
+                channel,
+                keyword if keyword is not None else "<tutte>",
+            )
+
+            scanned_count = 0
+            matched_count = 0
+            last_message_id: Optional[int] = None
             async for message in iter_messages_with_flood_wait(
                 client,
                 entity=channel,
                 search=keyword,
                 limit=limit
             ):
+                scanned_count += 1
+                if scanned_count % 25 == 0:
+                    logger.debug(
+                        "Progresso lettura canale=%s keyword=%s: messaggi_scansionati=%s ultimo_message_id=%s",
+                        channel,
+                        keyword if keyword is not None else "<tutte>",
+                        scanned_count,
+                        last_message_id,
+                    )
+
                 text = message.message or ""
                 if not text:
+                    last_message_id = int(message.id)
                     continue
 
                 if not message_matches_date_range(message.date, start_date, end_date):
+                    last_message_id = int(message.id)
                     continue
 
                 key = (channel, int(message.id))
-                results[key] = {
+                if key in seen_keys:
+                    last_message_id = int(message.id)
+                    continue
+
+                channel_results[key] = {
                     "message_id": int(message.id),
                     "channel_username": channel,
                     "date": message.date.astimezone(timezone.utc).isoformat(),
@@ -286,30 +405,62 @@ async def collect_messages(
                     "is_forwarded": bool(getattr(message, "fwd_from", None)),
                     "forward_from_chat": extract_forward_source(message),
                 }
+                matched_count += 1
+                last_message_id = int(message.id)
 
-    return list(results.values())
+            logger.info(
+                "Completata lettura canale=%s keyword=%s: scansionati=%s validi=%s",
+                channel,
+                keyword if keyword is not None else "<tutte>",
+                scanned_count,
+                matched_count,
+            )
+
+        channel_rows = list(channel_results.values())
+        append_records_to_csv(channel_rows, output_csv)
+        for key in channel_results:
+            seen_keys.add(key)
+        total_written += len(channel_rows)
+        logger.info(
+            "Canale completato=%s record_scritti=%s totale_progressivo=%s",
+            channel,
+            len(channel_rows),
+            total_written,
+        )
+
+    logger.info("Raccolta completata: record unici=%s", total_written)
+    return total_written
 
 
 def build_dataframe(records: List[Dict[str, Any]]) -> pd.DataFrame:
-    columns = [
-        "message_id",
-        "channel_username",
-        "date",
-        "text",
-        "views",
-        "forwards",
-        "is_forwarded",
-        "forward_from_chat",
-    ]
-
     if not records:
-        return pd.DataFrame(columns=columns)
+        logger.warning("Nessun record da convertire in DataFrame")
+        return pd.DataFrame(columns=OUTPUT_COLUMNS)
 
     df = pd.DataFrame(records)
-    return df[columns].sort_values(by=["channel_username", "date", "message_id"]).reset_index(drop=True)
+    logger.info("DataFrame costruito: righe=%s", len(df))
+    return df[OUTPUT_COLUMNS].sort_values(by=["channel_username", "date", "message_id"]).reset_index(drop=True)
+
+
+def load_results_dataframe(csv_path: str) -> pd.DataFrame:
+    path = Path(csv_path)
+    if not path.exists():
+        logger.warning("CSV output non trovato, DataFrame vuoto: %s", csv_path)
+        return pd.DataFrame(columns=OUTPUT_COLUMNS)
+
+    df = pd.read_csv(path)
+    if df.empty:
+        return pd.DataFrame(columns=OUTPUT_COLUMNS)
+
+    for column in OUTPUT_COLUMNS:
+        if column not in df.columns:
+            df[column] = ""
+
+    return df[OUTPUT_COLUMNS].sort_values(by=["channel_username", "date", "message_id"]).reset_index(drop=True)
 
 
 def save_to_csv(df: pd.DataFrame, output_path: str = str(DEFAULT_OUTPUT_CSV)) -> None:
+    logger.info("Salvataggio CSV in corso: %s", output_path)
     df.to_csv(
         output_path,
         index=False,
@@ -317,6 +468,7 @@ def save_to_csv(df: pd.DataFrame, output_path: str = str(DEFAULT_OUTPUT_CSV)) ->
         lineterminator="\n",
         quoting=csv.QUOTE_ALL,
     )
+    logger.info("Salvataggio CSV completato: %s", output_path)
 
 
 def print_summary(df: pd.DataFrame) -> None:
@@ -353,30 +505,44 @@ def print_summary(df: pd.DataFrame) -> None:
 
 
 async def main() -> None:
-    config = load_app_config(str(INPUT_CONFIG))
+    args = parse_args()
+    config = load_app_config(str(args.config))
+    effective_log_level = validate_log_level(args.log_level) if args.log_level else config.log_level
+    configure_logging(effective_log_level)
+    logger.info("Logger configurato con livello: %s", effective_log_level)
+    logger.info("Caricamento canali da CSV: %s", config.channels_source_csv)
+
     channels = load_channels_from_snowball_csv(
         config.channels_source_csv,
         config.channels_csv_column,
     )
+    logger.info("Canali caricati: %s", len(channels))
+
     keywords = config.keywords
     output_csv = config.output_csv
+    logger.info("Keyword configurate: %s", len(keywords))
+    logger.info("Output CSV configurato: %s", output_csv)
+    logger.info("Inizializzazione output CSV incrementale")
+    initialize_output_csv(output_csv)
 
-    #client = TelegramClient(config.session_name, config.api_id, config.api_hash)
-
+    logger.info("Avvio client Telegram con sessione: %s", config.session_name)
     async with TelegramClient(config.session_name, config.api_id, config.api_hash) as client:
-        records = await collect_messages(
+        logger.info("Client Telegram connesso")
+        total_written = await collect_messages(
             client=client,
             channels=channels,
             keywords=keywords,
             start_date=config.start_date,
             end_date=config.end_date,
-            limit=config.limit
+            limit=config.limit,
+            output_csv=output_csv,
         )
 
-    df = build_dataframe(records)
-    save_to_csv(df, output_csv)
+    logger.info("Totale record scritti su CSV: %s", total_written)
+    df = load_results_dataframe(output_csv)
     print(f"CSV salvato in: {output_csv}")
     print_summary(df)
+    logger.info("Esecuzione completata")
 
 
 if __name__ == "__main__":

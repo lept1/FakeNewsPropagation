@@ -14,7 +14,8 @@
     "output_csv": "data_collected/telegram_fakenews_analysis.csv",
     "start_date": null,
     "end_date": null,
-    "limit": 100
+    "limit": 100,
+    "log_level": "DEBUG"
   },
   "snowball": {
     "seed_channels": [
