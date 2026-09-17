@@ -64,7 +64,8 @@ class SamplingConfig:
 class RunConfig:
     telegram: TelegramConfig
     sampling: SamplingConfig
-    seed_channels: List[str]
+    seed_channels: List[Tuple[str, int]]  # List of (channel_ref, discovered_depth)
+    previous_depth: int
     channels_output: str
     relations_output: str
 
@@ -148,18 +149,43 @@ def load_run_config(config_file: str) -> RunConfig:
     if not session_name:
         raise ValueError("Campo mancante: telegram.session_name")
 
-    raw_seeds = snowball_cfg.get("seed_channels", [])
-    if not isinstance(raw_seeds, list):
-        raise ValueError("snowball.seed_channels deve essere una lista")
-
-    seed_channels = [
-        normalize_channel_ref(str(item))
-        for item in raw_seeds
-        if str(item).strip()
-    ]
-    seed_channels = list(dict.fromkeys(seed_channels))
-    if not seed_channels:
-        raise ValueError("snowball.seed_channels non puo essere vuoto")
+    restart = bool(snowball_cfg.get("restart", False))
+    if not isinstance(restart, bool):
+        raise ValueError("snowball.restart deve essere un valore booleano")
+    if restart:
+        # if restart use seed channels defined in the config, if not take seed channels from snowball_channels.csv
+        print("Snowball sampling will restart from the beginning.")
+        raw_seeds = snowball_cfg.get("seed_channels", [])
+        if not isinstance(raw_seeds, list):
+            raise ValueError("snowball.seed_channels deve essere una lista")
+        channels = [
+            normalize_channel_ref(str(item))
+            for item in raw_seeds
+            if str(item).strip()
+        ]
+        channels = list(dict.fromkeys(channels))
+        previous_depth = 0
+        seed_channels = [(ch, 0) for ch in channels]
+        if not seed_channels:
+            raise ValueError("snowball.seed_channels non puo essere vuoto")
+    else:
+        seed_channels = []
+        print("Snowball sampling will continue from the existing channels.")
+        # In this case, seed_channels will be populated from the existing snowball_channels.csv file.
+        # Read username and depth from the existing snowball_channels.csv file
+        try:
+            with open(DEFAULT_CHANNELS_OUTPUT, newline="", encoding="utf-8") as csvfile:
+                reader = csv.DictReader(csvfile)
+                # create a list of tuples (username, depth) to preserve the association
+                seed_channels = [
+                    (normalize_channel_ref(row["username"]), int(row["discovered_depth"]))
+                    for row in reader
+                    if row["username"].strip() and row["discovered_depth"].strip()
+                ]
+                if seed_channels:
+                    previous_depth = max(depth for _, depth in seed_channels)
+        except FileNotFoundError:
+            print(f"File {DEFAULT_CHANNELS_OUTPUT} non trovato. Nessun seed channel caricato.")
 
     try:
         messages_per_channel = int(snowball_cfg.get("messages_per_channel", 100))
@@ -195,6 +221,7 @@ def load_run_config(config_file: str) -> RunConfig:
             log_level=log_level,
         ),
         seed_channels=seed_channels,
+        previous_depth=previous_depth,
         channels_output=channels_output,
         relations_output=relations_output,
     )
@@ -366,17 +393,24 @@ async def resolve_source_channel(
 async def run_snowball_sampling(
     client: TelegramClient,
     seed_channels: List[str],
+    previous_depth: int,
     sampling_cfg: SamplingConfig,
     channels_output_file: str,
     relations_output_file: str,
 ) -> Tuple[int, int, int]:
-    queue: Deque[QueueItem] = deque([QueueItem(ch, 0) for ch in seed_channels])
-    visited: Set[str] = set()
+    if isinstance(seed_channels[0], tuple):
+        #set queue as seed channels with depth = the provided depth
+        queue: Deque[QueueItem] = deque([QueueItem(ch, depth) for ch, depth in seed_channels if depth == previous_depth])
+        #set visited channels as seed channels with depth < previous_depth
+        visited: Set[str] = {normalize_channel_ref(ch) for ch, depth in seed_channels if depth < previous_depth}
+    else:
+        queue: Deque[QueueItem] = deque([QueueItem(ch, 0) for ch in seed_channels])
+        visited: Set[str] = set()
 
     discovered_channel_keys: Set[str] = set()
     relations_count = 0
 
-    seed_set = {normalize_channel_ref(item) for item in seed_channels if item.strip()}
+    seed_set = {normalize_channel_ref(item[0]) for item in seed_channels if item[0].strip()}
     unresolved_seed_refs: Set[str] = set(seed_set)
 
     channels_writer = IncrementalCsvWriter(
@@ -563,6 +597,8 @@ async def run_snowball_sampling(
             channels_writer.add_row(build_unresolved_seed_record(unresolved_seed))
 
         maybe_flush_writers(force=True)
+        # Pause 10 seconds between processing batches to avoid hitting rate limits
+        await asyncio.sleep(10)
     finally:
         channels_writer.close()
         relations_writer.close()
@@ -684,6 +720,7 @@ def main() -> None:
         total_channels, seeds, relations_count = await run_snowball_sampling(
                 client=client,
                 seed_channels=run_cfg.seed_channels,
+                previous_depth=run_cfg.previous_depth,
                 sampling_cfg=run_cfg.sampling,
                 channels_output_file=channels_output,
                 relations_output_file=relations_output,
