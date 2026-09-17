@@ -16,10 +16,8 @@ Esempio:
 
 from __future__ import annotations
 
-import argparse
 import asyncio
 import csv
-import json
 import logging
 from collections import deque
 from contextlib import suppress
@@ -29,27 +27,16 @@ from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 import qrcode
 
+try:
+    from .config import DEFAULT_CONFIG_FILE, TelegramConfig, load_project_config
+except ImportError:
+    from config import DEFAULT_CONFIG_FILE, TelegramConfig, load_project_config
+
 from telethon import TelegramClient
 from telethon.errors import FloodWaitError
 from telethon.tl.types import Channel, PeerChannel
 
-
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-CONFIG_DIR = PROJECT_ROOT / "config"
-DATA_DIR = PROJECT_ROOT / "data_collected"
-
-DEFAULT_CONFIG_FILE = CONFIG_DIR / "config.json"
-DEFAULT_CHANNELS_OUTPUT = DATA_DIR / "snowball_channels.csv"
-DEFAULT_RELATIONS_OUTPUT = DATA_DIR / "snowball_relations.csv"
-
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class TelegramConfig:
-    api_id: int
-    api_hash: str
-    session_name: str
 
 
 @dataclass
@@ -76,26 +63,26 @@ class QueueItem:
     depth: int
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Esegue snowball sampling tra canali Telegram"
-    )
-    parser.add_argument(
-        "--config",
-        default=str(DEFAULT_CONFIG_FILE),
-        help="File JSON unico di configurazione",
-    )
-    parser.add_argument(
-        "--channels-output",
-        default=str(DEFAULT_CHANNELS_OUTPUT),
-        help="CSV output dei canali scoperti",
-    )
-    parser.add_argument(
-        "--relations-output",
-        default=str(DEFAULT_RELATIONS_OUTPUT),
-        help="CSV output delle relazioni channel_to/channel_from",
-    )
-    return parser.parse_args()
+# def parse_args() -> argparse.Namespace:
+#     parser = argparse.ArgumentParser(
+#         description="Esegue snowball sampling tra canali Telegram"
+#     )
+#     parser.add_argument(
+#         "--config",
+#         default=str(DEFAULT_CONFIG_FILE),
+#         help="File JSON unico di configurazione",
+#     )
+#     parser.add_argument(
+#         "--channels-output",
+#         default=None,
+#         help="Percorso base CSV canali (verra aggiunto un suffisso timestamp)",
+#     )
+#     parser.add_argument(
+#         "--relations-output",
+#         default=None,
+#         help="Percorso base CSV relazioni (verra aggiunto un suffisso timestamp)",
+#     )
+#     return parser.parse_args()
 
 
 def normalize_channel_ref(raw_value: str) -> str:
@@ -112,56 +99,77 @@ def normalize_channel_ref(raw_value: str) -> str:
     return value.strip()
 
 
-def load_json_config(file_path: str) -> Dict[str, Any]:
-    path = Path(file_path)
-    if not path.exists():
-        raise FileNotFoundError(f"File config non trovato: {file_path}")
-
-    with path.open("r", encoding="utf-8") as handle:
-        raw_cfg = json.load(handle)
-
-    if not isinstance(raw_cfg, dict):
-        raise ValueError("Il file config deve contenere un oggetto JSON")
-
-    return raw_cfg
+def with_run_timestamp(output_file: str, run_stamp: str) -> str:
+    output_path = Path(output_file)
+    suffix = output_path.suffix or ".csv"
+    filename = f"{output_path.stem}_{run_stamp}{suffix}"
+    return str(output_path.with_name(filename))
 
 
-def load_run_config(config_file: str) -> RunConfig:
-    raw_cfg = load_json_config(config_file)
+def find_latest_csv_for_base(base_output_file: str) -> Optional[Path]:
+    base_path = Path(base_output_file)
+    if not base_path.parent.exists():
+        return None
 
-    telegram_cfg = raw_cfg.get("telegram", {})
-    snowball_cfg = raw_cfg.get("snowball", {})
+    pattern = f"{base_path.stem}*{base_path.suffix}"
+    candidates = [item for item in base_path.parent.glob(pattern) if item.is_file()]
+    if not candidates:
+        return None
 
-    if not isinstance(telegram_cfg, dict) or not isinstance(snowball_cfg, dict):
-        raise ValueError("Sezioni 'telegram' e 'snowball' mancanti o non valide")
+    return max(candidates, key=lambda item: item.stat().st_mtime)
 
-    try:
-        api_id = int(telegram_cfg["api_id"])
-    except KeyError as exc:
-        raise ValueError("Campo mancante: telegram.api_id") from exc
-    except (TypeError, ValueError) as exc:
-        raise ValueError("telegram.api_id deve essere un intero") from exc
 
-    api_hash = str(telegram_cfg.get("api_hash", "")).strip()
-    session_name = str(telegram_cfg.get("session_name", "")).strip()
-    if not api_hash:
-        raise ValueError("Campo mancante: telegram.api_hash")
-    if not session_name:
-        raise ValueError("Campo mancante: telegram.session_name")
+def load_seed_channels_from_csv(channels_csv_file: Path) -> Tuple[List[Tuple[str, int]], int]:
+    depth_by_channel: Dict[str, int] = {}
 
-    restart = bool(snowball_cfg.get("restart", False))
-    if not isinstance(restart, bool):
-        raise ValueError("snowball.restart deve essere un valore booleano")
+    with channels_csv_file.open("r", newline="", encoding="utf-8") as csvfile:
+        reader = csv.DictReader(csvfile)
+        for row in reader:
+            channel_ref = normalize_channel_ref(str(row.get("username", "")))
+            if not channel_ref:
+                continue
+
+            discovered_depth = _safe_int(row.get("discovered_depth", ""), default=0)
+            previous = depth_by_channel.get(channel_ref)
+            if previous is None or discovered_depth > previous:
+                depth_by_channel[channel_ref] = discovered_depth
+
+    seed_channels = [(channel_ref, depth) for channel_ref, depth in depth_by_channel.items()]
+    previous_depth = max(depth_by_channel.values(), default=0)
+    return seed_channels, previous_depth
+
+
+def load_run_config(
+    config_file: Optional[str] = None,
+    channels_output_override: Optional[str] = None,
+    relations_output_override: Optional[str] = None,
+) -> RunConfig:
+
+    if config_file is None:
+        config_file = str(DEFAULT_CONFIG_FILE)
+    project_cfg = load_project_config(config_file)
+    telegram_cfg = project_cfg.telegram
+    snowball_cfg = project_cfg.snowball
+
+    restart = snowball_cfg.restart
+    channels_output = snowball_cfg.channels_output_csv
+    relations_output = snowball_cfg.relations_output_csv
+
+    if channels_output_override:
+        channels_output = str(channels_output_override).strip()
+    if relations_output_override:
+        relations_output = str(relations_output_override).strip()
+
+    previous_depth = 0
+    seed_channels: List[Tuple[str, int]] = []
+
     if restart:
         # if restart use seed channels defined in the config, if not take seed channels from snowball_channels.csv
         print("Snowball sampling will restart from the beginning.")
-        raw_seeds = snowball_cfg.get("seed_channels", [])
-        if not isinstance(raw_seeds, list):
-            raise ValueError("snowball.seed_channels deve essere una lista")
         channels = [
-            normalize_channel_ref(str(item))
-            for item in raw_seeds
-            if str(item).strip()
+            normalize_channel_ref(item)
+            for item in snowball_cfg.seed_channels
+            if item.strip()
         ]
         channels = list(dict.fromkeys(channels))
         previous_depth = 0
@@ -169,56 +177,31 @@ def load_run_config(config_file: str) -> RunConfig:
         if not seed_channels:
             raise ValueError("snowball.seed_channels non puo essere vuoto")
     else:
-        seed_channels = []
         print("Snowball sampling will continue from the existing channels.")
-        # In this case, seed_channels will be populated from the existing snowball_channels.csv file.
-        # Read username and depth from the existing snowball_channels.csv file
-        try:
-            with open(DEFAULT_CHANNELS_OUTPUT, newline="", encoding="utf-8") as csvfile:
-                reader = csv.DictReader(csvfile)
-                # create a list of tuples (username, depth) to preserve the association
-                seed_channels = [
-                    (normalize_channel_ref(row["username"]), int(row["discovered_depth"]))
-                    for row in reader
-                    if row["username"].strip() and row["discovered_depth"].strip()
-                ]
-                if seed_channels:
-                    previous_depth = max(depth for _, depth in seed_channels)
-        except FileNotFoundError:
-            print(f"File {DEFAULT_CHANNELS_OUTPUT} non trovato. Nessun seed channel caricato.")
-
-    try:
-        messages_per_channel = int(snowball_cfg.get("messages_per_channel", 100))
-        max_depth = int(snowball_cfg.get("max_depth", 1))
-        save_interval_seconds = int(snowball_cfg.get("save_interval_seconds", 30))
-    except (TypeError, ValueError) as exc:
-        raise ValueError("Valori snowball numerici non validi") from exc
-
-    log_level = str(snowball_cfg.get("log_level", "INFO")).strip().upper()
-    if not isinstance(getattr(logging, log_level, None), int):
-        raise ValueError("snowball.log_level deve essere uno tra DEBUG, INFO, WARNING, ERROR, CRITICAL")
-
-    if messages_per_channel <= 0:
-        raise ValueError("snowball.messages_per_channel deve essere > 0")
-    if max_depth < 0:
-        raise ValueError("snowball.max_depth deve essere >= 0")
-    if save_interval_seconds <= 0:
-        raise ValueError("snowball.save_interval_seconds deve essere > 0")
-
-    channels_output = str(
-        snowball_cfg.get("channels_output_csv", DEFAULT_CHANNELS_OUTPUT)
-    ).strip() or str(DEFAULT_CHANNELS_OUTPUT)
-    relations_output = str(
-        snowball_cfg.get("relations_output_csv", DEFAULT_RELATIONS_OUTPUT)
-    ).strip() or str(DEFAULT_RELATIONS_OUTPUT)
+        latest_channels_csv = find_latest_csv_for_base(channels_output)
+        if latest_channels_csv is None:
+            print(
+                f"Nessun file canali trovato per base '{channels_output}'. "
+                "Nessun seed channel caricato."
+            )
+        else:
+            seed_channels, previous_depth = load_seed_channels_from_csv(latest_channels_csv)
+            print(
+                f"Ripresa da file canali: {latest_channels_csv} "
+                f"(canali={len(seed_channels)}, depth={previous_depth})"
+            )
 
     return RunConfig(
-        telegram=TelegramConfig(api_id=api_id, api_hash=api_hash, session_name=session_name),
+        telegram=TelegramConfig(
+            api_id=telegram_cfg.api_id,
+            api_hash=telegram_cfg.api_hash,
+            session_name=telegram_cfg.session_name,
+        ),
         sampling=SamplingConfig(
-            messages_per_channel=messages_per_channel,
-            max_depth=max_depth,
-            save_interval_seconds=save_interval_seconds,
-            log_level=log_level,
+            messages_per_channel=snowball_cfg.messages_per_channel,
+            max_depth=snowball_cfg.max_depth,
+            save_interval_seconds=snowball_cfg.save_interval_seconds,
+            log_level=snowball_cfg.log_level,
         ),
         seed_channels=seed_channels,
         previous_depth=previous_depth,
@@ -392,20 +375,19 @@ async def resolve_source_channel(
 
 async def run_snowball_sampling(
     client: TelegramClient,
-    seed_channels: List[str],
+    seed_channels: List[Tuple[str, int]],
     previous_depth: int,
     sampling_cfg: SamplingConfig,
     channels_output_file: str,
     relations_output_file: str,
 ) -> Tuple[int, int, int]:
-    if isinstance(seed_channels[0], tuple):
-        #set queue as seed channels with depth = the provided depth
-        queue: Deque[QueueItem] = deque([QueueItem(ch, depth) for ch, depth in seed_channels if depth == previous_depth])
-        #set visited channels as seed channels with depth < previous_depth
-        visited: Set[str] = {normalize_channel_ref(ch) for ch, depth in seed_channels if depth < previous_depth}
-    else:
-        queue: Deque[QueueItem] = deque([QueueItem(ch, 0) for ch in seed_channels])
-        visited: Set[str] = set()
+    # Resume strategy: process channels at current depth, treat lower depths as already visited.
+    queue: Deque[QueueItem] = deque(
+        [QueueItem(ch, depth) for ch, depth in seed_channels if depth == previous_depth]
+    )
+    visited: Set[str] = {
+        normalize_channel_ref(ch) for ch, depth in seed_channels if depth < previous_depth
+    }
 
     discovered_channel_keys: Set[str] = set()
     relations_count = 0
@@ -674,14 +656,19 @@ def print_summary(total_channels: int, seeds: int, relations_count: int) -> None
 
 
 def main() -> None:
-    args = parse_args()
-    run_cfg = load_run_config(args.config)
+    # args = parse_args()
+    run_cfg = load_run_config()
+
     configure_logging(run_cfg.sampling.log_level)
 
-    channels_output = args.channels_output if args.channels_output else run_cfg.channels_output
-    relations_output = (
-        args.relations_output if args.relations_output else run_cfg.relations_output
-    )
+    run_stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    channels_output = with_run_timestamp(run_cfg.channels_output, run_stamp)
+    relations_output = with_run_timestamp(run_cfg.relations_output, run_stamp)
+
+    logger.info("Output base canali: %s", run_cfg.channels_output)
+    logger.info("Output base relazioni: %s", run_cfg.relations_output)
+    logger.info("Output run canali: %s", channels_output)
+    logger.info("Output run relazioni: %s", relations_output)
 
     async def _async_main() -> None:
         client=TelegramClient(

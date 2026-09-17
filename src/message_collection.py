@@ -17,11 +17,10 @@ from __future__ import annotations
 import asyncio
 import argparse
 import csv
-import json
 import logging
 from collections import Counter, defaultdict
 from dataclasses import dataclass
-from datetime import datetime, time, timezone
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import pandas as pd
@@ -30,6 +29,11 @@ from telethon.errors import FloodWaitError
 from telethon.tl.types import PeerChannel, PeerChat, PeerUser
 
 from pathlib import Path
+
+try:
+    from .config import load_project_config, validate_log_level
+except ImportError:
+    from config import load_project_config, validate_log_level
 
 PARENT_DIR = Path(__file__).parent.parent
 
@@ -94,117 +98,24 @@ def configure_logging(log_level: str) -> None:
     )
 
 
-def validate_log_level(log_level: str) -> str:
-    normalized = str(log_level).strip().upper() or "INFO"
-    if not isinstance(getattr(logging, normalized, None), int):
-        raise ValueError(
-            "message_collection.log_level deve essere uno tra DEBUG, INFO, WARNING, ERROR, CRITICAL"
-        )
-    return normalized
-
-
-def load_json_config(config_file: str) -> Dict[str, Any]:
-    path = Path(config_file)
-    if not path.exists():
-        raise FileNotFoundError(f"File configurazione non trovato: {config_file}")
-
-    with path.open("r", encoding="utf-8") as fh:
-        data = json.load(fh)
-
-    if not isinstance(data, dict):
-        raise ValueError("Il file di configurazione deve contenere un oggetto JSON")
-
-    return data
-
-
-def parse_iso_datetime(raw_value: Optional[str], *, is_end: bool) -> Optional[datetime]:
-    if not raw_value:
-        return None
-
-    value = raw_value.strip()
-    dt = datetime.fromisoformat(value)
-    if dt.tzinfo is None:
-        if "T" not in value:
-            dt_time = time.max.replace(microsecond=0) if is_end else time.min
-            dt = datetime.combine(dt.date(), dt_time)
-        dt = dt.replace(tzinfo=timezone.utc)
-
-    return dt.astimezone(timezone.utc)
-
-
 def load_app_config(config_file: str) -> AppConfig:
     logger.debug("Caricamento configurazione da: %s", config_file)
-    cfg = load_json_config(config_file)
-
-    telegram = cfg.get("telegram", {})
-    message_cfg = cfg.get("message_collection", {})
-    snowball_cfg = cfg.get("snowball", {})
-
-    if not isinstance(telegram, dict) or not isinstance(message_cfg, dict):
-        raise ValueError("Sezioni 'telegram' e 'message_collection' mancanti o non valide")
-    if not isinstance(snowball_cfg, dict):
-        raise ValueError("Sezione 'snowball' mancante o non valida")
-
-    try:
-        api_id = int(telegram["api_id"])
-    except KeyError as exc:
-        raise ValueError("Campo mancante: telegram.api_id") from exc
-    except (TypeError, ValueError) as exc:
-        raise ValueError("telegram.api_id deve essere un intero") from exc
-
-    api_hash = str(telegram.get("api_hash", "")).strip()
-    session_name = str(telegram.get("session_name", "")).strip()
-    if not api_hash:
-        raise ValueError("Campo mancante: telegram.api_hash")
-    if not session_name:
-        raise ValueError("Campo mancante: telegram.session_name")
-
-    raw_keywords = message_cfg.get("keywords", [])
-    if not isinstance(raw_keywords, list):
-        raise ValueError("message_collection.keywords deve essere una lista")
-    keywords = [str(item).strip() for item in raw_keywords if str(item).strip()]
-    if not keywords:
-        keywords = [""]
-
-    output_csv = str(message_cfg.get("output_csv", DEFAULT_OUTPUT_CSV)).strip()
-    if not output_csv:
-        output_csv = str(DEFAULT_OUTPUT_CSV)
-
-    channels_source_csv = message_cfg.get("channels_source_csv")
-    if channels_source_csv is None or not channels_source_csv:
-        channels_source_csv = str(DEFAULT_SNOWBALL_CHANNELS_CSV).strip()
-
-    channels_csv_column = str(message_cfg.get("channels_csv_column", "username")).strip()
-    if not channels_csv_column:
-        channels_csv_column = "username"
-
-    start_date = parse_iso_datetime(
-        str(message_cfg.get("start_date")).strip(),
-        is_end=False,
-    ) if message_cfg.get("start_date") else None
-    end_date = parse_iso_datetime(
-        str(message_cfg.get("end_date")).strip(),
-        is_end=True,
-    ) if message_cfg.get("end_date") else None
-
-    if start_date and end_date and start_date > end_date:
-        raise ValueError("message_collection.start_date non puo essere successiva a end_date")
-
-    limit = int(message_cfg.get("limit", 100))
-    log_level = validate_log_level(str(message_cfg.get("log_level", "INFO")))
+    project_cfg = load_project_config(config_file)
+    telegram = project_cfg.telegram
+    message_cfg = project_cfg.message_collection
 
     return AppConfig(
-        api_id=api_id,
-        api_hash=api_hash,
-        session_name=session_name,
-        channels_source_csv=channels_source_csv,
-        channels_csv_column=channels_csv_column,
-        keywords=keywords,
-        output_csv=output_csv,
-        start_date=start_date,
-        end_date=end_date,
-        limit=limit,
-        log_level=log_level,
+        api_id=telegram.api_id,
+        api_hash=telegram.api_hash,
+        session_name=telegram.session_name,
+        channels_source_csv=message_cfg.channels_source_csv,
+        channels_csv_column=message_cfg.channels_csv_column,
+        keywords=message_cfg.keywords,
+        output_csv=message_cfg.output_csv,
+        start_date=message_cfg.start_date,
+        end_date=message_cfg.end_date,
+        limit=message_cfg.limit,
+        log_level=message_cfg.log_level,
     )
 
 
@@ -507,7 +418,11 @@ def print_summary(df: pd.DataFrame) -> None:
 async def main() -> None:
     args = parse_args()
     config = load_app_config(str(args.config))
-    effective_log_level = validate_log_level(args.log_level) if args.log_level else config.log_level
+    effective_log_level = (
+        validate_log_level(args.log_level, section_name="message_collection.log_level")
+        if args.log_level
+        else config.log_level
+    )
     configure_logging(effective_log_level)
     logger.info("Logger configurato con livello: %s", effective_log_level)
     logger.info("Caricamento canali da CSV: %s", config.channels_source_csv)

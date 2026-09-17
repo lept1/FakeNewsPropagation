@@ -16,8 +16,6 @@ Output generati:
 
 from __future__ import annotations
 
-import json
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Tuple
 
@@ -25,10 +23,11 @@ import matplotlib.pyplot as plt
 import networkx as nx
 import pandas as pd
 
+try:
+    from .config import DEFAULT_CONFIG_FILE, GraphAnalysisConfig, load_project_config
+except ImportError:
+    from config import DEFAULT_CONFIG_FILE, GraphAnalysisConfig, load_project_config
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-CONFIG_DIR = PROJECT_ROOT / "config"
-INPUT_CONFIG = CONFIG_DIR / "config.json"
 
 REQUIRED_COLUMNS = {
     "channel_to_id",
@@ -40,73 +39,6 @@ REQUIRED_COLUMNS = {
     "from_name_fallback",
     "target_message_id",
 }
-
-
-@dataclass
-class GraphConfig:
-    relations_input_csv: str
-    relation_matrix_output_csv: str
-    graph_output_prefix: str
-    min_weight: int
-    include_unresolved_sources: bool
-
-
-def load_json_config(config_file: str) -> Dict[str, object]:
-    path = Path(config_file)
-    if not path.exists():
-        raise FileNotFoundError(f"File configurazione non trovato: {config_file}")
-
-    with path.open("r", encoding="utf-8") as handle:
-        raw_cfg = json.load(handle)
-
-    if not isinstance(raw_cfg, dict):
-        raise ValueError("Il file config deve contenere un oggetto JSON")
-
-    return raw_cfg
-
-
-def load_graph_config(config_file: str) -> GraphConfig:
-    cfg = load_json_config(config_file)
-
-    snowball_cfg = cfg.get("snowball", {})
-    graph_cfg = cfg.get("graph_analysis", {})
-
-    if not isinstance(snowball_cfg, dict):
-        raise ValueError("Sezione 'snowball' mancante o non valida")
-    if not isinstance(graph_cfg, dict):
-        graph_cfg = {}
-
-    default_relations_csv = str(
-        snowball_cfg.get("relations_output_csv", "data_collected/snowball_relations.csv")
-    )
-    relations_input_csv = str(
-        graph_cfg.get("relations_input_csv", default_relations_csv)
-    ).strip()
-    if not relations_input_csv:
-        relations_input_csv = default_relations_csv
-
-    relation_matrix_output_csv = str(
-        graph_cfg.get("relation_matrix_output_csv", "data_collected/snowball_relation_matrix.csv")
-    ).strip() or "data_collected/snowball_relation_matrix.csv"
-
-    graph_output_prefix = str(
-        graph_cfg.get("graph_output_prefix", "data_collected/snowball_relation_graph")
-    ).strip() or "data_collected/snowball_relation_graph"
-
-    try:
-        min_weight = int(graph_cfg.get("min_weight", 1))
-    except (TypeError, ValueError) as exc:
-        raise ValueError("graph_analysis.min_weight deve essere un intero") from exc
-
-    include_unresolved_sources = bool(graph_cfg.get("include_unresolved_sources", False))
-
-    return GraphConfig(
-        relations_input_csv=relations_input_csv,
-        relation_matrix_output_csv=relation_matrix_output_csv,
-        graph_output_prefix=graph_output_prefix,
-        min_weight=max(1, min_weight),
-        include_unresolved_sources=include_unresolved_sources,
-    )
 
 
 def load_dataset(csv_path: str) -> pd.DataFrame:
@@ -338,7 +270,7 @@ def print_matrix_summary(matrix_df: pd.DataFrame) -> None:
 
 
 def main() -> None:
-    cfg = load_graph_config(str(INPUT_CONFIG))
+    cfg: GraphAnalysisConfig = load_project_config(str(DEFAULT_CONFIG_FILE)).graph_analysis
     df = load_dataset(cfg.relations_input_csv)
 
     edges_df = build_edges_dataframe(

@@ -9,6 +9,9 @@ Le configurazioni sono state unificate in un solo file:
 - config/config.json
 - config/config.example.json
 
+Le validazioni e il parsing delle configurazioni sono centralizzati in `src/config.py`
+e vengono importati da `src/message_collection.py`, `src/snowball_sampling.py` e `src/graph_analysis.py`.
+
 La cartella var e stata rinominata in config.
 
 Il file include:
