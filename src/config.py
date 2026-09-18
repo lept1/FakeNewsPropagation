@@ -146,12 +146,13 @@ def _validate_snowball_config(snowball_cfg: Dict[str, Any]) -> SnowballConfig:
         raise ValueError("snowball.seed_channels deve essere una lista")
     seed_channels = [str(item).strip() for item in raw_seeds if str(item).strip()]
 
-    channels_output_csv = str(
-        snowball_cfg.get("channels_output_csv", DEFAULT_SNOWBALL_CHANNELS_OUTPUT_CSV)
-    ).strip() or str(DEFAULT_SNOWBALL_CHANNELS_OUTPUT_CSV)
-    relations_output_csv = str(
-        snowball_cfg.get("relations_output_csv", DEFAULT_SNOWBALL_RELATIONS_OUTPUT_CSV)
-    ).strip() or str(DEFAULT_SNOWBALL_RELATIONS_OUTPUT_CSV)
+    channels_output_csv = snowball_cfg.get("channels_output_csv", DEFAULT_SNOWBALL_CHANNELS_OUTPUT_CSV)
+    if channels_output_csv is None:
+        channels_output_csv = DEFAULT_SNOWBALL_CHANNELS_OUTPUT_CSV
+
+    relations_output_csv = snowball_cfg.get("relations_output_csv", DEFAULT_SNOWBALL_RELATIONS_OUTPUT_CSV)
+    if relations_output_csv is None:
+        relations_output_csv = DEFAULT_SNOWBALL_RELATIONS_OUTPUT_CSV
 
     try:
         messages_per_channel = int(snowball_cfg.get("messages_per_channel", 100))

@@ -26,11 +26,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 import qrcode
+import pandas as pd
+
 
 try:
-    from .config import DEFAULT_CONFIG_FILE, TelegramConfig, load_project_config
+    from .config import DEFAULT_CONFIG_FILE, TelegramConfig, load_project_config, DATA_DIR
 except ImportError:
-    from config import DEFAULT_CONFIG_FILE, TelegramConfig, load_project_config
+    from config import DEFAULT_CONFIG_FILE, TelegramConfig, load_project_config, DATA_DIR
 
 from telethon import TelegramClient
 from telethon.errors import FloodWaitError
@@ -119,24 +121,11 @@ def find_latest_csv_for_base(base_output_file: str) -> Optional[Path]:
     return max(candidates, key=lambda item: item.stat().st_mtime)
 
 
-def load_seed_channels_from_csv(channels_csv_file: Path) -> Tuple[List[Tuple[str, int]], int]:
-    depth_by_channel: Dict[str, int] = {}
-
-    with channels_csv_file.open("r", newline="", encoding="utf-8") as csvfile:
-        reader = csv.DictReader(csvfile)
-        for row in reader:
-            channel_ref = normalize_channel_ref(str(row.get("username", "")))
-            if not channel_ref:
-                continue
-
-            discovered_depth = _safe_int(row.get("discovered_depth", ""), default=0)
-            previous = depth_by_channel.get(channel_ref)
-            if previous is None or discovered_depth > previous:
-                depth_by_channel[channel_ref] = discovered_depth
-
-    seed_channels = [(channel_ref, depth) for channel_ref, depth in depth_by_channel.items()]
-    previous_depth = max(depth_by_channel.values(), default=0)
-    return seed_channels, previous_depth
+def load_seed_channels(channels_df: pd.DataFrame) -> Tuple[List[Tuple[str, int]], int]:
+    df_channels = channels_df.loc[:, ["username", "discovered_depth"]]
+    seed_channels = df_channels.to_records(index=False)
+    previous_depth = df_channels["discovered_depth"].max()
+    return seed_channels.tolist(), previous_depth
 
 
 def load_run_config(
@@ -178,18 +167,17 @@ def load_run_config(
             raise ValueError("snowball.seed_channels non puo essere vuoto")
     else:
         print("Snowball sampling will continue from the existing channels.")
-        latest_channels_csv = find_latest_csv_for_base(channels_output)
-        if latest_channels_csv is None:
-            print(
-                f"Nessun file canali trovato per base '{channels_output}'. "
-                "Nessun seed channel caricato."
-            )
+        # Load all previously discovered seed channels from all the previous runs
+        # Read all the files snowball_channels_* and merge them in a DataFrame (or similar structure)
+
+        if not any(Path(DATA_DIR).glob("snowball_channels_*.csv")):
+            print("Nessun file snowball_channels_*.csv trovato. Nessun seed channel caricato.")
         else:
-            seed_channels, previous_depth = load_seed_channels_from_csv(latest_channels_csv)
-            print(
-                f"Ripresa da file canali: {latest_channels_csv} "
-                f"(canali={len(seed_channels)}, depth={previous_depth})"
+            df_channels = pd.concat(
+                [pd.read_csv(f) for f in Path(DATA_DIR).glob("snowball_channels_*.csv")],
+                ignore_index=True,
             )
+            seed_channels, previous_depth = load_seed_channels(df_channels)
 
     return RunConfig(
         telegram=TelegramConfig(
