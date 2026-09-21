@@ -123,6 +123,10 @@ def find_latest_csv_for_base(base_output_file: str) -> Optional[Path]:
 
 def load_seed_channels(channels_df: pd.DataFrame) -> Tuple[List[Tuple[str, int]], int]:
     df_channels = channels_df.loc[:, ["username", "discovered_depth"]]
+    logger.debug("Loading seed channels from DataFrame with %d entries", len(df_channels))
+    logger.debug("Removing duplicate seed channels and nan values")
+    df_channels = df_channels.drop_duplicates(subset=["username"])
+    df_channels = df_channels.dropna(subset=["username"])
     seed_channels = df_channels.to_records(index=False)
     previous_depth = df_channels["discovered_depth"].max()
     return seed_channels.tolist(), previous_depth
@@ -154,7 +158,7 @@ def load_run_config(
 
     if restart:
         # if restart use seed channels defined in the config, if not take seed channels from snowball_channels.csv
-        print("Snowball sampling will restart from the beginning.")
+        logger.info("Snowball sampling will restart from the beginning.")
         channels = [
             normalize_channel_ref(item)
             for item in snowball_cfg.seed_channels
@@ -323,8 +327,13 @@ async def resolve_channel_entity(
         logger.debug("Resolved channel entity for '%s': %s", channel_ref, entity)
     except FloodWaitError as exc:
         logger.warning("Flood wait error while resolving channel '%s': %s", channel_ref, exc)
-        await asyncio.sleep(int(exc.seconds) + 1)
-        entity = await client.get_entity(channel_ref)
+        if int(exc.seconds)>3600*3:
+            logger.error("Flood wait too long for channel '%s': %s", channel_ref, exc)
+            return None
+        else:
+            logger.info("Waiting for %s seconds due to flood wait for channel '%s'", int(exc.seconds), channel_ref)
+            await asyncio.sleep(int(exc.seconds) + 1)
+            entity = await client.get_entity(channel_ref)
 
     except Exception as exc:
         logger.warning("Impossibile risolvere il canale '%s': %s", channel_ref, exc)
@@ -348,9 +357,13 @@ async def resolve_source_channel(
     try:
         source_entity = await client.get_entity(from_peer)
     except FloodWaitError as exc:
-        logger.warning("Flood wait error while resolving source channel '%s': %s", source_id, exc)
-        await asyncio.sleep(int(exc.seconds) + 1)
-        source_entity = await client.get_entity(from_peer)
+        if int(exc.seconds) > 3600 * 3:
+            logger.error("Flood wait too long for source channel '%s': %s", source_id, exc)
+            return None, source_id
+        else:
+            logger.warning("Flood wait error while resolving source channel '%s': %s", source_id, exc)
+            await asyncio.sleep(int(exc.seconds) + 1)
+            source_entity = await client.get_entity(from_peer)
     except Exception as exc:
         logger.warning("Impossibile risolvere il canale sorgente '%s': %s", source_id, exc)
         source_entity = None
