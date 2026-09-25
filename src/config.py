@@ -12,12 +12,18 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_DIR = PROJECT_ROOT / "config"
 DATA_DIR = PROJECT_ROOT / "data_collected"
 
-DEFAULT_CONFIG_FILE = CONFIG_DIR / "config.json"
-DEFAULT_MESSAGE_OUTPUT_CSV = DATA_DIR / "telegram_fakenews_analysis.csv"
-DEFAULT_SNOWBALL_CHANNELS_OUTPUT_CSV = DATA_DIR / "snowball_channels.csv"
-DEFAULT_SNOWBALL_RELATIONS_OUTPUT_CSV = DATA_DIR / "snowball_relations.csv"
-DEFAULT_RELATION_MATRIX_OUTPUT_CSV = DATA_DIR / "snowball_relation_matrix.csv"
-DEFAULT_GRAPH_OUTPUT_PREFIX = DATA_DIR / "snowball_relation_graph"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+MESSAGE_OUTPUT_DIR = DATA_DIR /"message_collection"
+SNOWBALL_CHANNELS_OUTPUT_DIR = DATA_DIR/ "snowball_channels"
+SNOWBALL_RELATIONS_OUTPUT_DIR = DATA_DIR/ "snowball_relations"
+RELATION_MATRIX_OUTPUT_DIR = DATA_DIR / "relation_matrix"
+GRAPH_OUTPUT_DIR = DATA_DIR / "relation_graph"
+
+# if config directory and config file do not exist raise an error
+if not CONFIG_DIR.exists():
+    raise FileNotFoundError(f"Config directory not found: {CONFIG_DIR}")
+if not CONFIG_FILE.exists():
+    raise FileNotFoundError(f"Config file not found: {CONFIG_FILE}")
 
 
 @dataclass(frozen=True)
@@ -29,13 +35,15 @@ class TelegramConfig:
 
 @dataclass(frozen=True)
 class MessageCollectionConfig:
-    channels_source_csv: str
+    channels_source_csv: List[str]
     channels_csv_column: str
+    elaborated_channels_csv: str
     keywords: List[str]
     output_csv: str
     start_date: Optional[datetime]
     end_date: Optional[datetime]
     limit: int
+    save_interval_seconds: int
     log_level: str
 
 
@@ -53,7 +61,7 @@ class SnowballConfig:
 
 @dataclass(frozen=True)
 class GraphAnalysisConfig:
-    relations_input_csv: str
+    relations_input_dir: str
     relation_matrix_output_csv: str
     graph_output_prefix: str
     min_weight: int
@@ -146,13 +154,23 @@ def _validate_snowball_config(snowball_cfg: Dict[str, Any]) -> SnowballConfig:
         raise ValueError("snowball.seed_channels deve essere una lista")
     seed_channels = [str(item).strip() for item in raw_seeds if str(item).strip()]
 
-    channels_output_csv = snowball_cfg.get("channels_output_csv", DEFAULT_SNOWBALL_CHANNELS_OUTPUT_CSV)
-    if channels_output_csv is None:
-        channels_output_csv = DEFAULT_SNOWBALL_CHANNELS_OUTPUT_CSV
+    filename_with_timestamp= datetime.now().strftime("%Y%m%d_%H%M%S")
+    channels_output_dir =snowball_cfg.get("channels_output_dir")
+    if not channels_output_dir:
+        channels_output_dir = SNOWBALL_CHANNELS_OUTPUT_DIR
+    channels_output_dir = Path(channels_output_dir)
+    channels_output_csv = channels_output_dir / f"channels_{filename_with_timestamp}.csv"
+    # check if the channels output directory exists and create it if it doesn't
+    if not channels_output_dir.exists():
+        channels_output_dir.mkdir(parents=True, exist_ok=True)
 
-    relations_output_csv = snowball_cfg.get("relations_output_csv", DEFAULT_SNOWBALL_RELATIONS_OUTPUT_CSV)
-    if relations_output_csv is None:
-        relations_output_csv = DEFAULT_SNOWBALL_RELATIONS_OUTPUT_CSV
+    relations_output_dir = snowball_cfg.get("relations_output_dir")
+    if not relations_output_dir:
+        relations_output_dir = SNOWBALL_RELATIONS_OUTPUT_DIR
+    relations_output_dir = Path(relations_output_dir)
+    if not relations_output_dir.exists():
+        relations_output_dir.mkdir(parents=True, exist_ok=True)
+    relations_output_csv = relations_output_dir / f"relations_{filename_with_timestamp}.csv"
 
     try:
         messages_per_channel = int(snowball_cfg.get("messages_per_channel", 100))
@@ -195,18 +213,28 @@ def _validate_message_collection_config(
         # Empty keyword means "all messages" when passed to Telethon search.
         keywords = [""]
 
-    output_csv = str(message_cfg.get("output_csv", DEFAULT_MESSAGE_OUTPUT_CSV)).strip()
-    if not output_csv:
-        output_csv = str(DEFAULT_MESSAGE_OUTPUT_CSV)
+    filename_with_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    message_output_dir = message_cfg.get("output_dir")
+    if not message_output_dir:
+        message_output_dir = MESSAGE_OUTPUT_DIR
+    message_output_dir = Path(message_output_dir)
+    if not message_output_dir.exists():
+        message_output_dir.mkdir(parents=True, exist_ok=True)
+    output_csv = str(message_output_dir / f"messages_{filename_with_timestamp}.csv").strip()
 
-    channels_source_csv = message_cfg.get("channels_source_csv")
-    if channels_source_csv is None or not str(channels_source_csv).strip():
-        channels_source_csv = snowball_cfg.channels_output_csv
-    channels_source_csv = str(channels_source_csv).strip()
+    channels_source_dir = message_cfg.get("channels_source_dir")
+    if not channels_source_dir:
+        channels_source_dir = SNOWBALL_CHANNELS_OUTPUT_DIR
+    channels_source_dir = Path(channels_source_dir)
+    if not channels_source_dir.exists():
+        channels_source_dir.mkdir(parents=True, exist_ok=True)
+    # in channels source csv a list of all csv files in channels_source_dir containing channel information will be stored
+    channels_source_csv =[str(item) for item in channels_source_dir.glob("*.csv") if item.is_file()]
 
     channels_csv_column = str(message_cfg.get("channels_csv_column", "username")).strip()
     if not channels_csv_column:
         channels_csv_column = "username"
+    elaborated_channels_csv = str(message_output_dir / f"elaborated_channels.csv").strip()
 
     start_date = (
         parse_iso_datetime(str(message_cfg.get("start_date")).strip(), is_end=False)
@@ -228,6 +256,13 @@ def _validate_message_collection_config(
     if limit <= 0:
         raise ValueError("message_collection.limit deve essere > 0")
 
+    try:
+        save_interval_seconds = int(message_cfg.get("save_interval_seconds", 30))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("message_collection.save_interval_seconds deve essere un intero") from exc
+    if save_interval_seconds <= 0:
+        raise ValueError("message_collection.save_interval_seconds deve essere > 0")
+
     return MessageCollectionConfig(
         channels_source_csv=channels_source_csv,
         channels_csv_column=channels_csv_column,
@@ -236,6 +271,8 @@ def _validate_message_collection_config(
         start_date=start_date,
         end_date=end_date,
         limit=limit,
+        save_interval_seconds=save_interval_seconds,
+        elaborated_channels_csv=elaborated_channels_csv,
         log_level=validate_log_level(
             message_cfg.get("log_level", "INFO"),
             section_name="message_collection.log_level",
@@ -247,19 +284,24 @@ def _validate_graph_analysis_config(
     graph_cfg: Dict[str, Any],
     snowball_cfg: SnowballConfig,
 ) -> GraphAnalysisConfig:
-    default_relations_input = snowball_cfg.relations_output_csv
+    relations_input_dir = graph_cfg.get("relations_input_dir", SNOWBALL_RELATIONS_OUTPUT_DIR)
 
-    relations_input_csv = str(
-        graph_cfg.get("relations_input_csv", default_relations_input)
-    ).strip() or default_relations_input
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    relation_matrix_output_dir = graph_cfg.get("relation_matrix_output_dir")
+    if not relation_matrix_output_dir:
+        relation_matrix_output_dir = RELATION_MATRIX_OUTPUT_DIR
+    relation_matrix_output_dir = Path(relation_matrix_output_dir)
+    if not relation_matrix_output_dir.exists():
+        relation_matrix_output_dir.mkdir(parents=True, exist_ok=True)
+    relation_matrix_output_csv = str(relation_matrix_output_dir / f"relation_matrix_{timestamp}.csv")
 
-    relation_matrix_output_csv = str(
-        graph_cfg.get("relation_matrix_output_csv", DEFAULT_RELATION_MATRIX_OUTPUT_CSV)
-    ).strip() or str(DEFAULT_RELATION_MATRIX_OUTPUT_CSV)
-
-    graph_output_prefix = str(
-        graph_cfg.get("graph_output_prefix", DEFAULT_GRAPH_OUTPUT_PREFIX)
-    ).strip() or str(DEFAULT_GRAPH_OUTPUT_PREFIX)
+    graph_output_dir = graph_cfg.get("graph_output_dir")
+    if not graph_output_dir:
+        graph_output_dir = GRAPH_OUTPUT_DIR
+    graph_output_dir = Path(graph_output_dir)
+    if not graph_output_dir.exists():
+        graph_output_dir.mkdir(parents=True, exist_ok=True)
+    graph_output_prefix = str(graph_output_dir / f"graph_{timestamp}")
 
     try:
         min_weight = int(graph_cfg.get("min_weight", 1))
@@ -271,7 +313,7 @@ def _validate_graph_analysis_config(
         raise ValueError("graph_analysis.include_unresolved_sources deve essere booleano")
 
     return GraphAnalysisConfig(
-        relations_input_csv=relations_input_csv,
+        relations_input_dir=relations_input_dir,
         relation_matrix_output_csv=relation_matrix_output_csv,
         graph_output_prefix=graph_output_prefix,
         min_weight=max(1, min_weight),
@@ -279,7 +321,7 @@ def _validate_graph_analysis_config(
     )
 
 
-def load_project_config(config_file: str = str(DEFAULT_CONFIG_FILE)) -> ProjectConfig:
+def load_project_config(config_file: str = str(CONFIG_FILE)) -> ProjectConfig:
     raw_cfg = _load_json_config(config_file)
 
     telegram_cfg = _require_dict(raw_cfg, "telegram")

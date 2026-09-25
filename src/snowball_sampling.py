@@ -30,9 +30,9 @@ import pandas as pd
 
 
 try:
-    from .config import DEFAULT_CONFIG_FILE, TelegramConfig, load_project_config, DATA_DIR
+    from .config import DEFAULT_CONFIG_FILE, TelegramConfig, load_project_config
 except ImportError:
-    from config import DEFAULT_CONFIG_FILE, TelegramConfig, load_project_config, DATA_DIR
+    from config import DEFAULT_CONFIG_FILE, TelegramConfig, load_project_config
 
 from telethon import TelegramClient
 from telethon.errors import FloodWaitError
@@ -101,11 +101,11 @@ def normalize_channel_ref(raw_value: str) -> str:
     return value.strip()
 
 
-def with_run_timestamp(output_file: str, run_stamp: str) -> str:
-    output_path = Path(output_file)
-    suffix = output_path.suffix or ".csv"
-    filename = f"{output_path.stem}_{run_stamp}{suffix}"
-    return str(output_path.with_name(filename))
+# def with_run_timestamp(output_file: str, run_stamp: str) -> str:
+#     output_path = Path(output_file)
+#     suffix = output_path.suffix or ".csv"
+#     filename = f"{output_path.stem}_{run_stamp}{suffix}"
+#     return str(output_path.with_name(filename))
 
 
 def find_latest_csv_for_base(base_output_file: str) -> Optional[Path]:
@@ -172,13 +172,13 @@ def load_run_config(
     else:
         print("Snowball sampling will continue from the existing channels.")
         # Load all previously discovered seed channels from all the previous runs
-        # Read all the files snowball_channels_* and merge them in a DataFrame (or similar structure)
+        # Read all the files in snowball_channels folder and merge them in a DataFrame (or similar structure)
 
-        if not any(Path(DATA_DIR).glob("snowball_channels_*.csv")):
-            print("Nessun file snowball_channels_*.csv trovato. Nessun seed channel caricato.")
+        if not any(project_cfg.snowball.channels_output_dir.glob("*.csv")):
+            print("Nessun file csv trovato. Nessun seed channel caricato.")
         else:
             df_channels = pd.concat(
-                [pd.read_csv(f) for f in Path(DATA_DIR).glob("snowball_channels_*.csv")],
+                [pd.read_csv(f) for f in project_cfg.snowball.channels_output_dir.glob("*.csv")],
                 ignore_index=True,
             )
             seed_channels, previous_depth = load_seed_channels(df_channels)
@@ -662,9 +662,9 @@ def main() -> None:
 
     configure_logging(run_cfg.sampling.log_level)
 
-    run_stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    channels_output = with_run_timestamp(run_cfg.channels_output, run_stamp)
-    relations_output = with_run_timestamp(run_cfg.relations_output, run_stamp)
+    
+    channels_output = run_cfg.channels_output
+    relations_output = run_cfg.relations_output
 
     logger.info("Output base canali: %s", run_cfg.channels_output)
     logger.info("Output base relazioni: %s", run_cfg.relations_output)

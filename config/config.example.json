@@ -5,16 +5,17 @@
     "session_name": "demo_telegram_session"
   },
   "message_collection": {
-    "channels_source_csv": "data_collected/snowball_channels.csv",
+    "channels_source_dir": "data_collected/snowball_channels/",
     "channels_csv_column": "username",
     "keywords": [
-      "fake news",
-      "disinformazione"
+      "keyword 1",
+      "pippo"
     ],
-    "output_csv": "data_collected/telegram_fakenews_analysis.csv",
+    "output_dir": "data_collected/message_collection/",
     "start_date": null,
     "end_date": null,
     "limit": 100,
+    "save_interval_seconds": 30,
     "log_level": "DEBUG"
   },
   "snowball": {
@@ -27,13 +28,13 @@
     "max_depth": 2,
     "save_interval_seconds": 30,
     "log_level": "INFO",
-    "channels_output_csv": "data_collected/snowball_channels.csv",
-    "relations_output_csv": "data_collected/snowball_relations.csv"
+    "channels_output_dir": "data_collected/snowball_channels/",
+    "relations_output_dir": "data_collected/snowball_relations/"
   },
   "graph_analysis": {
-    "relations_input_csv": "data_collected/snowball_relations.csv",
-    "relation_matrix_output_csv": "data_collected/snowball_relation_matrix.csv",
-    "graph_output_prefix": "data_collected/snowball_relation_graph",
+    "relations_input_dir": "data_collected/snowball_relations/",
+    "relation_matrix_output_dir": "data_collected/relation_matrix/",
+    "graph_output_dir": "data_collected/relation_graph/",
     "min_weight": 1,
     "include_unresolved_sources": false
   }
