@@ -2,3 +2,5 @@ config/config.json
 *.csv
 *.session
 __pycache__/
+*.html
+*_files/
