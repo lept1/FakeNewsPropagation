@@ -37,5 +37,12 @@
     "graph_output_dir": "data_collected/relation_graph/",
     "min_weight": 1,
     "include_unresolved_sources": false
+  },
+  "channel_name_analysis": {
+    "channels_input_glob": "data_collected/snowball_channels/*.csv",
+    "output_dir": "data_collected/channel_name_analysis/",
+    "top_n": 40,
+    "min_token_len": 2,
+    "log_level": "INFO"
   }
 }

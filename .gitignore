@@ -4,3 +4,4 @@ config/config.json
 __pycache__/
 *.html
 *_files/
+data_collected/*
