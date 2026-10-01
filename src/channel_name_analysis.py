@@ -34,6 +34,9 @@ import numpy as np
 import pandas as pd
 import networkx as nx
 import matplotlib.pyplot as plt
+import nltk
+nltk.download("stopwords")
+nltk.download('punkt_tab')
 
 try:
     from .config import (
@@ -223,20 +226,24 @@ def load_merged_channels(input_glob: str) -> pd.DataFrame:
 
 
 def build_name_table(merged_df: pd.DataFrame) -> pd.DataFrame:
-    username_df = merged_df[["channel_id", "username", "source_file"]].copy()
-    username_df["name_kind"] = "username"
-    username_df = username_df.rename(columns={"username": "name"})
+    # username_df = merged_df[["channel_id", "username", "source_file"]].copy()
+    # username_df["name_kind"] = "username"
+    # username_df = username_df.rename(columns={"username": "name"})
 
     title_df = merged_df[["channel_id", "title", "source_file"]].copy()
     title_df["name_kind"] = "title"
     title_df = title_df.rename(columns={"title": "name"})
+    # dropna sui titoli vuoti
+    title_df = title_df.dropna(subset=["name"])
+    title_df = title_df[title_df["name"].str.strip() != ""].reset_index(drop=True)
 
-    names_df = pd.concat([username_df, title_df], ignore_index=True)
-    names_df["name"] = names_df["name"].fillna("").astype(str).str.strip()
-    names_df = names_df[names_df["name"] != ""].reset_index(drop=True)
-    return names_df
+    # names_df = pd.concat([username_df, title_df], ignore_index=True)
+    # names_df["name"] = names_df["name"].fillna("").astype(str).str.strip()
+    # names_df = names_df[names_df["name"] != ""].reset_index(drop=True)
+    # return names_df
+    return title_df
 
-
+ 
 def add_text_features(names_df: pd.DataFrame, min_token_len: int) -> pd.DataFrame:
     features_df = names_df.copy()
     features_df["tokens"] = features_df["name"].map(lambda value: tokenize(value, min_token_len))
@@ -249,10 +256,12 @@ def add_text_features(names_df: pd.DataFrame, min_token_len: int) -> pd.DataFram
     return features_df
 
 
-def compute_word_frequency(features_df: pd.DataFrame) -> pd.DataFrame:
+def compute_word_frequency(features_df: pd.DataFrame, stopwords: set[str] | None = None) -> pd.DataFrame:
+    # Calcolo della frequenza delle parole nei token esclusi gli articoli e le preposizioni
     counter: Counter[str] = Counter()
     for tokens in features_df["tokens"]:
-        counter.update(tokens)
+        filtered_tokens = [tok for tok in tokens if tok not in ARTICLE_PREP_IT and (stopwords is None or tok not in stopwords)]
+        counter.update(filtered_tokens)
 
     freq_df = pd.DataFrame(
         [{"token": token, "frequency": freq} for token, freq in counter.items()]
@@ -281,81 +290,81 @@ def compute_length_stats(features_df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def compute_semantic_scores(features_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    per_name_rows = []
-    field_counter: Counter[str] = Counter()
+# def compute_semantic_scores(features_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+#     per_name_rows = []
+#     field_counter: Counter[str] = Counter()
 
-    for idx, row in features_df.iterrows():
-        tokens = row["tokens"]
-        scores = {
-            field: sum(1 for tok in tokens if tok in lexicon)
-            for field, lexicon in SEMANTIC_FIELDS.items()
-        }
+#     for idx, row in features_df.iterrows():
+#         tokens = row["tokens"]
+#         scores = {
+#             field: sum(1 for tok in tokens if tok in lexicon)
+#             for field, lexicon in SEMANTIC_FIELDS.items()
+#         }
 
-        dominant_field = "none"
-        if any(scores.values()):
-            dominant_field = max(scores, key=scores.get)
-            field_counter[dominant_field] += 1
+#         dominant_field = "none"
+#         if any(scores.values()):
+#             dominant_field = max(scores, key=scores.get)
+#             field_counter[dominant_field] += 1
 
-        per_name_rows.append(
-            {
-                "row_index": int(idx),
-                "name": row["name"],
-                "name_kind": row["name_kind"],
-                **scores,
-                "dominant_semantic_field": dominant_field,
-            }
-        )
+#         per_name_rows.append(
+#             {
+#                 "row_index": int(idx),
+#                 "name": row["name"],
+#                 "name_kind": row["name_kind"],
+#                 **scores,
+#                 "dominant_semantic_field": dominant_field,
+#             }
+#         )
 
-    per_name_df = pd.DataFrame(per_name_rows)
+#     per_name_df = pd.DataFrame(per_name_rows)
 
-    summary_df = pd.DataFrame(
-        [{"semantic_field": field, "count": field_counter.get(field, 0)} for field in SEMANTIC_FIELDS]
-    )
-    if not summary_df.empty:
-        total = max(1, int(summary_df["count"].sum()))
-        summary_df["pct"] = summary_df["count"] / total * 100.0
-        summary_df = summary_df.sort_values(by=["count", "semantic_field"], ascending=[False, True]).reset_index(drop=True)
+#     summary_df = pd.DataFrame(
+#         [{"semantic_field": field, "count": field_counter.get(field, 0)} for field in SEMANTIC_FIELDS]
+#     )
+#     if not summary_df.empty:
+#         total = max(1, int(summary_df["count"].sum()))
+#         summary_df["pct"] = summary_df["count"] / total * 100.0
+#         summary_df = summary_df.sort_values(by=["count", "semantic_field"], ascending=[False, True]).reset_index(drop=True)
 
-    return per_name_df, summary_df
+#     return per_name_df, summary_df
 
 
-def compute_tone_scores(features_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    per_name_rows = []
-    tone_counter: Counter[str] = Counter()
+# def compute_tone_scores(features_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+#     per_name_rows = []
+#     tone_counter: Counter[str] = Counter()
 
-    for idx, row in features_df.iterrows():
-        tokens = row["tokens"]
-        scores = {
-            tone: sum(1 for tok in tokens if tok in lexicon)
-            for tone, lexicon in TONE_LEXICON.items()
-        }
+#     for idx, row in features_df.iterrows():
+#         tokens = row["tokens"]
+#         scores = {
+#             tone: sum(1 for tok in tokens if tok in lexicon)
+#             for tone, lexicon in TONE_LEXICON.items()
+#         }
 
-        dominant_tone = "none"
-        if any(scores.values()):
-            dominant_tone = max(scores, key=scores.get)
-            tone_counter[dominant_tone] += 1
+#         dominant_tone = "none"
+#         if any(scores.values()):
+#             dominant_tone = max(scores, key=scores.get)
+#             tone_counter[dominant_tone] += 1
 
-        per_name_rows.append(
-            {
-                "row_index": int(idx),
-                "name": row["name"],
-                "name_kind": row["name_kind"],
-                **scores,
-                "dominant_tone": dominant_tone,
-            }
-        )
+#         per_name_rows.append(
+#             {
+#                 "row_index": int(idx),
+#                 "name": row["name"],
+#                 "name_kind": row["name_kind"],
+#                 **scores,
+#                 "dominant_tone": dominant_tone,
+#             }
+#         )
 
-    per_name_df = pd.DataFrame(per_name_rows)
-    summary_df = pd.DataFrame(
-        [{"tone": tone, "count": tone_counter.get(tone, 0)} for tone in TONE_LEXICON]
-    )
-    if not summary_df.empty:
-        total = max(1, int(summary_df["count"].sum()))
-        summary_df["pct"] = summary_df["count"] / total * 100.0
-        summary_df = summary_df.sort_values(by=["count", "tone"], ascending=[False, True]).reset_index(drop=True)
+#     per_name_df = pd.DataFrame(per_name_rows)
+#     summary_df = pd.DataFrame(
+#         [{"tone": tone, "count": tone_counter.get(tone, 0)} for tone in TONE_LEXICON]
+#     )
+#     if not summary_df.empty:
+#         total = max(1, int(summary_df["count"].sum()))
+#         summary_df["pct"] = summary_df["count"] / total * 100.0
+#         summary_df = summary_df.sort_values(by=["count", "tone"], ascending=[False, True]).reset_index(drop=True)
 
-    return per_name_df, summary_df
+#     return per_name_df, summary_df
 
 
 def compute_zipf(freq_df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, float]]:
@@ -382,9 +391,10 @@ def compute_zipf(freq_df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, float]]
     return zipf_df, metrics
 
 
-def compute_ngrams(features_df: pd.DataFrame, n: int) -> pd.DataFrame:
+def compute_ngrams(features_df: pd.DataFrame, n: int, stopwords: Set[str] = set()) -> pd.DataFrame:
     counter: Counter[Tuple[str, ...]] = Counter()
     for tokens in features_df["tokens"]:
+        tokens = [tok for tok in tokens if tok not in stopwords]
         counter.update(iter_ngrams(tokens, n))
 
     rows = []
@@ -399,11 +409,11 @@ def compute_ngrams(features_df: pd.DataFrame, n: int) -> pd.DataFrame:
     return ngram_df
 
 
-def build_word_cooccurrence_graph(features_df: pd.DataFrame):
+def build_word_cooccurrence_graph(features_df: pd.DataFrame,stopwords: Set[str], min_cooccurrence: int = 2):
     graph = nx.Graph()
 
     for tokens in features_df["tokens"]:
-        unique_tokens = sorted(set(tokens))
+        unique_tokens = sorted(set(tokens) - stopwords)
         for tok in unique_tokens:
             if tok not in graph:
                 graph.add_node(tok)
@@ -413,6 +423,10 @@ def build_word_cooccurrence_graph(features_df: pd.DataFrame):
                 graph[a][b]["weight"] += 1
             else:
                 graph.add_edge(a, b, weight=1)
+
+    # Remove edges with weight less than min_cooccurrence
+    edges_to_remove = [(a, b) for a, b, d in graph.edges(data=True) if d["weight"] < min_cooccurrence]
+    graph.remove_edges_from(edges_to_remove)
 
     return graph
 
@@ -502,8 +516,8 @@ def write_summary(
     names_df: pd.DataFrame,
     length_stats_df: pd.DataFrame,
     zipf_metrics: Dict[str, float],
-    semantic_summary_df: pd.DataFrame,
-    tone_summary_df: pd.DataFrame,
+    # semantic_summary_df: pd.DataFrame,
+    # tone_summary_df: pd.DataFrame,
 ) -> None:
     stats_map = {row["metric"]: row["value"] for _, row in length_stats_df.iterrows()}
     summary = {
@@ -516,14 +530,14 @@ def write_summary(
             stats_map.get("pct_names_with_article_or_preposition", 0.0)
         ),
         "zipf": zipf_metrics,
-        "dominant_semantic_field_counts": {
-            row["semantic_field"]: int(row["count"])
-            for _, row in semantic_summary_df.iterrows()
-        },
-        "dominant_tone_counts": {
-            row["tone"]: int(row["count"])
-            for _, row in tone_summary_df.iterrows()
-        },
+        # "dominant_semantic_field_counts": {
+        #     row["semantic_field"]: int(row["count"])
+        #     for _, row in semantic_summary_df.iterrows()
+        # },
+        # "dominant_tone_counts": {
+        #     row["tone"]: int(row["count"])
+        #     for _, row in tone_summary_df.iterrows()
+        # },
     }
 
     with (output_dir / "summary.json").open("w", encoding="utf-8") as handle:
@@ -546,16 +560,61 @@ def main() -> None:
     logger.info("Nomi validi estratti (username + title): %s", len(names_df))
 
     logger.info("Calcolo metriche testuali e statistiche")
-    freq_df = compute_word_frequency(features_df)
     length_stats_df = compute_length_stats(features_df)
-    semantic_per_name_df, semantic_summary_df = compute_semantic_scores(features_df)
-    tone_per_name_df, tone_summary_df = compute_tone_scores(features_df)
+    # Escludi articoli e preposizioni dai token prima di calcolare la frequenza delle parole
+    # in più lingue
+    stopwords_it = nltk.corpus.stopwords.words("italian")
+    stopwords_en = nltk.corpus.stopwords.words("english")
+    stopwords_ru = nltk.corpus.stopwords.words("russian")
+    stopwords_de = nltk.corpus.stopwords.words("german")
+    stopwords_es = nltk.corpus.stopwords.words("spanish")
+    stopwords_fr = nltk.corpus.stopwords.words("french")
+    all_stopwords = set(stopwords_it + stopwords_en + stopwords_ru + stopwords_de + stopwords_es + stopwords_fr )
+    freq_df = compute_word_frequency(features_df, stopwords=all_stopwords)
+    # semantic_per_name_df, semantic_summary_df = compute_semantic_scores(features_df)
+    # tone_per_name_df, tone_summary_df = compute_tone_scores(features_df)
     zipf_df, zipf_metrics = compute_zipf(freq_df)
     bigrams_df = compute_ngrams(features_df, n=2)
     trigrams_df = compute_ngrams(features_df, n=3)
+    # bigrammi e trigrammi calcolati sopra senza considerare le stopwords
+    bigrams_no_stopwords_df = compute_ngrams(features_df, n=2, stopwords=all_stopwords)
+    trigrams_no_stopwords_df = compute_ngrams(features_df, n=3, stopwords=all_stopwords)
+
+    #compute n-grams without stopwords using everygrams
+    clean_tokens = features_df["tokens"].apply(lambda toks: [t for t in toks if t not in all_stopwords])
+    everygrams_no_stopwords_df = clean_tokens.apply(lambda toks: list(nltk.everygrams(toks)))
+    everygrams_no_stopwords_df = everygrams_no_stopwords_df.explode().reset_index(drop=True)
+    # compute frequency of everygrams without stopwords
+    everygrams_freq_df = everygrams_no_stopwords_df.value_counts().reset_index()
+    everygrams_freq_df.columns = ["everygram", "frequency"]
+    everygrams_freq_df['everygram'] = everygrams_freq_df['everygram'].apply(lambda x: " ".join(x))
+
+
+    # costruzione del grafo di co-occorrenza e calcolo della centralità
+    # usando https://github.com/vittot/text2graphapi/tree/master
+    from text2graphapi.src.Cooccurrence import Cooccurrence
+    # from text2graphapi.src.Heterogeneous import Heterogeneous
+    # from text2graphapi.src.IntegratedSyntacticGraph import ISG
+
+
+    to_word_coocc_graph = Cooccurrence(graph_type = 'DiGraph', 
+            language = 'it', #apply_preprocessing = True, 
+            window_size = 3, output_format = 'networkx')
+    # corpus has to be a list of dictionaries, where ecah dict conatins an 'id' and 'doc' text data
+    corpus = [{"id": i, "doc": name} for i, name in enumerate(features_df["name"].tolist())]
+    to_word_coocc_graph.transform(corpus)
+    # show image of the resulting graph
+    
+    plt.figure(figsize=(10, 10))
+    nx.draw(graph_nx, with_labels=True, node_size=500, node_color="skyblue", font_size=10, font_weight="bold")
+    plt.savefig(cfg.output_dir / "word_cooccurrence_graph.png")
+    plt.close()
+
+
+
 
     logger.info("Costruzione grafo co-occorrenza e centralita")
-    graph = build_word_cooccurrence_graph(features_df)
+    graph = build_word_cooccurrence_graph(features_df, stopwords=all_stopwords, min_cooccurrence=2)
     centrality_df = compute_graph_centrality(graph)
 
     logger.info("Scrittura output CSV in corso")
@@ -568,13 +627,16 @@ def main() -> None:
 
     freq_df.to_csv(cfg.output_dir / "word_frequency.csv", index=False, encoding="utf-8")
     length_stats_df.to_csv(cfg.output_dir / "length_stats.csv", index=False, encoding="utf-8")
-    semantic_per_name_df.to_csv(cfg.output_dir / "semantic_scores_per_name.csv", index=False, encoding="utf-8")
-    semantic_summary_df.to_csv(cfg.output_dir / "semantic_summary.csv", index=False, encoding="utf-8")
-    tone_per_name_df.to_csv(cfg.output_dir / "tone_scores_per_name.csv", index=False, encoding="utf-8")
-    tone_summary_df.to_csv(cfg.output_dir / "tone_summary.csv", index=False, encoding="utf-8")
+    # semantic_per_name_df.to_csv(cfg.output_dir / "semantic_scores_per_name.csv", index=False, encoding="utf-8")
+    # semantic_summary_df.to_csv(cfg.output_dir / "semantic_summary.csv", index=False, encoding="utf-8")
+    # tone_per_name_df.to_csv(cfg.output_dir / "tone_scores_per_name.csv", index=False, encoding="utf-8")
+    # tone_summary_df.to_csv(cfg.output_dir / "tone_summary.csv", index=False, encoding="utf-8")
     zipf_df.to_csv(cfg.output_dir / "zipf_table.csv", index=False, encoding="utf-8")
     bigrams_df.to_csv(cfg.output_dir / "bigrams_frequency.csv", index=False, encoding="utf-8")
     trigrams_df.to_csv(cfg.output_dir / "trigrams_frequency.csv", index=False, encoding="utf-8")
+    bigrams_no_stopwords_df.to_csv(cfg.output_dir / "bigrams_no_stopwords_frequency.csv", index=False, encoding="utf-8")
+    trigrams_no_stopwords_df.to_csv(cfg.output_dir / "trigrams_no_stopwords_frequency.csv", index=False, encoding="utf-8")
+    everygrams_freq_df.to_csv(cfg.output_dir / "everygrams_no_stopwords_frequency.csv", index=False, encoding="utf-8")
 
     nx.write_gexf(graph, cfg.output_dir / "word_cooccurrence_graph.gexf")
     centrality_df.to_csv(cfg.output_dir / "word_graph_centrality.csv", index=False, encoding="utf-8")
@@ -587,8 +649,8 @@ def main() -> None:
         names_df,
         length_stats_df,
         zipf_metrics,
-        semantic_summary_df,
-        tone_summary_df,
+        # semantic_summary_df,
+        # tone_summary_df,
     )
     logger.info("Analisi completata con successo")
 
