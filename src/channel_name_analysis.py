@@ -24,6 +24,9 @@ from itertools import combinations
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
+from sklearn.feature_extraction.text import CountVectorizer
+import networkx as nx
+
 import numpy as np
 import pandas as pd
 import networkx as nx
@@ -316,9 +319,9 @@ def main() -> None:
     stopwords_es = nltk.corpus.stopwords.words("spanish")
     stopwords_fr = nltk.corpus.stopwords.words("french")
     all_stopwords = set(stopwords_it + stopwords_en + stopwords_ru + stopwords_de + stopwords_es + stopwords_fr )
+    all_stopwords = list(all_stopwords)
 
-    from sklearn.feature_extraction.text import CountVectorizer
-    count_model = CountVectorizer(ngram_range=(1,3), stop_words=all_stopwords) # default unigram model
+    count_model = CountVectorizer(ngram_range=(1,3), stop_words=all_stopwords, min_df=0.01, max_df=0.9) # default unigram model
     docs = names_df["name"].tolist()
     X = count_model.fit_transform(docs)
     # X[X > 0] = 1 # run this line if you don't want extra within-text cooccurence (see below)
@@ -337,15 +340,14 @@ def main() -> None:
 
     # create a graph from the co-occurrence matrix
     logger.info("Costruzione grafo co-occorrenza e centralita")
-    import networkx as nx
-    G = nx.from_scipy_sparse_matrix(Xc)
+    G = nx.from_scipy_sparse_array(Xc)
     mapping = {i: word for i, word in enumerate(words)}
     G = nx.relabel_nodes(G, mapping)
     # visualize the graph
-    import matplotlib.pyplot as plt
-    plt.figure(figsize=(10, 10))
-    nx.draw(G, with_labels=True, node_size=500, node_color="skyblue", font_size=10, font_weight="bold")
-    plt.show()
+    # import matplotlib.pyplot as plt
+    # plt.figure(figsize=(10, 10))
+    # nx.draw(G, with_labels=True, node_size=500, node_color="skyblue", font_size=10, font_weight="bold")
+    # plt.show()
     # save plot 
     logger.info('Saving graph in gexf format')
     nx.write_gexf(G, cfg.output_dir / "word_cooccurrence_graph.gexf")
